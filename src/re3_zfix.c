@@ -182,9 +182,15 @@ static volatile LONG g_dipup_total = 0;
 static volatile LONG g_dipup_accepted = 0;
 static volatile LONG g_dipup_rejected = 0;
 static volatile LONG g_dpup_transparent_accepted = 0;
+static volatile LONG g_dipup_transparent_accepted = 0;
 static volatile LONG g_frame_counter = 0;
 static volatile LONG g_model_uv_corrected_draws = 0;
 static volatile LONG g_model_uv_corrected_coords = 0;
+static volatile LONG g_model_subpixel_stabilized_draws = 0;
+static volatile LONG g_model_subpixel_stabilized_coords = 0;
+static volatile LONG g_model_depth_biased_draws = 0;
+static volatile LONG g_model_depth_biased_vertices = 0;
+static volatile LONG g_transparent_thin_stabilized_draws = 0;
 static volatile LONG g_depth_clear_count = 0;
 static volatile LONG g_depth_clear_failures = 0;
 static volatile LONG g_owned_depth_creates = 0;
@@ -208,15 +214,18 @@ static const int g_model_linear_filter = 0;
 static const int g_model_gouraud_shading = 1;
 static const int g_model_dither = 1;
 static const int g_model_uv_correction = 1;
+static const int g_model_subpixel_stabilization = 1;
 static const int g_model_screen_expand = 0;
 static const int g_skip_axis_tile_draws = 1;
 static const int g_min_vertex_alpha = 250;
 static const int g_reject_alpha_only_when_blending = 1;
 static const int g_diagnostics = 1;
 static const int g_opaque_model_disable_alpha_blend = 0;
+static const int g_model_depth_bias_enabled = 1;
 static const int g_transparent_model_z_test = 1;
 static const int g_transparent_model_depth_adjust = 1;
 static const int g_transparent_model_z_write_soft_opaque = 0;
+static const int g_transparent_thin_stabilization = 1;
 static const LONG g_initial_frame_summaries = 3;
 static const LONG g_frame_summary_interval = 300;
 
@@ -230,11 +239,19 @@ static const float g_spike_long_extent = 520.0f;
 static const float g_spike_thin_extent = 2.0f;
 static const float g_min_depth_variance = 0.000001f;
 static const float g_min_rhw_variance = 0.00000001f;
-static const float g_model_depth_bias = 0.0f;
+static const float g_model_depth_bias = -0.000012f;
+static const float g_transparent_model_depth_bias = -0.000004f;
+static const float g_transparent_thin_depth_bias = -0.000007f;
 static const float g_model_uv_snap_grid = 255.0f;
 static const float g_model_uv_center_grid = 256.0f;
 static const float g_model_uv_snap_epsilon = 0.015f;
+static const float g_model_subpixel_grid = 16.0f;
+static const float g_model_subpixel_epsilon = 0.0315f;
 static const float g_model_screen_expand_pixels = 0.35f;
+static const float g_transparent_thin_max_long_extent = 520.0f;
+static const float g_transparent_thin_max_short_extent = 4.0f;
+static const float g_transparent_thin_max_area = 24000.0f;
+static const float g_transparent_thin_expand_pixels = 0.12f;
 static const int g_soft_opaque_alpha_min = 224;
 
 static void PatchAllImports(void);
@@ -888,8 +905,8 @@ static int IsSpikeLikeTriangle(const DrawBounds* bounds)
   if (!bounds)
     return 0;
 
-  const float width = bounds->width < 0.0f ? -bounds->width : bounds->width;
-  const float height = bounds->height < 0.0f ? -bounds->height : bounds->height;
+  const float width = AbsF(bounds->width);
+  const float height = AbsF(bounds->height);
   const float long_extent = width > height ? width : height;
   const float short_extent = width > height ? height : width;
 
@@ -900,6 +917,30 @@ static int IsSpikeLikeTriangle(const DrawBounds* bounds)
       (long_extent / short_extent) > g_max_triangle_aspect)
     return 1;
   return 0;
+}
+
+static int IsSoftTransparentThinTriangle(const DrawBounds* bounds)
+{
+  if (!g_transparent_thin_stabilization || !bounds)
+    return 0;
+
+  const float width = AbsF(bounds->width);
+  const float height = AbsF(bounds->height);
+  const float long_extent = width > height ? width : height;
+  const float short_extent = width > height ? height : width;
+
+  if (short_extent <= 0.0001f)
+    return 0;
+  if (g_transparent_thin_max_long_extent > 0.0f &&
+      long_extent > g_transparent_thin_max_long_extent)
+    return 0;
+  if (g_transparent_thin_max_short_extent > 0.0f &&
+      short_extent > g_transparent_thin_max_short_extent)
+    return 0;
+  if (g_transparent_thin_max_area > 0.0f &&
+      bounds->area > g_transparent_thin_max_area)
+    return 0;
+  return 1;
 }
 
 static int IsFlat2DLayerBounds(const DrawBounds* bounds)
@@ -993,7 +1034,8 @@ static int IsTransparentModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primi
       *reason = "transparent_rhw";
     return 0;
   }
-  if (IsSpikeLikeTriangle(&local_bounds))
+  if (IsSpikeLikeTriangle(&local_bounds) &&
+      !IsSoftTransparentThinTriangle(&local_bounds))
   {
     if (reason)
       *reason = "transparent_spike";
@@ -1094,21 +1136,46 @@ static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, 
   return 1;
 }
 
-static DWORD ApplyModelDepth(D3D9TLVERTEX* vertices, DWORD vertex_count)
+static float ModelDepthBiasForDraw(const DrawBounds* bounds, int transparent, int thin_transparent)
 {
-  if (!vertices || vertex_count == 0)
+  if (!g_model_depth_bias_enabled)
+    return 0.0f;
+
+  float bias = transparent ? g_transparent_model_depth_bias : g_model_depth_bias;
+  if (thin_transparent)
+    bias = g_transparent_thin_depth_bias;
+
+  if (bounds)
+  {
+    const float z_span = bounds->max_z - bounds->min_z;
+    if (z_span < (g_min_depth_variance * 4.0f))
+      bias *= 0.5f;
+    if (g_max_screen_area > 0.0f && bounds->area > (g_max_screen_area * 0.5f))
+      bias *= 0.5f;
+  }
+  return bias;
+}
+
+static DWORD ApplyModelDepth(D3D9TLVERTEX* vertices, DWORD vertex_count, float depth_bias)
+{
+  if (!vertices || vertex_count == 0 || AbsF(depth_bias) <= 0.0f)
     return 0;
 
   DWORD changed = 0;
   for (DWORD i = 0; i < vertex_count; i++)
   {
     const float original_z = vertices[i].sz;
-    const float new_z = ClampDepth(original_z + g_model_depth_bias);
+    const float new_z = ClampDepth(original_z + depth_bias);
     vertices[i].sz = new_z;
     if (new_z != original_z)
       changed++;
   }
 
+  if (changed)
+  {
+    InterlockedIncrement(&g_model_depth_biased_draws);
+    InterlockedExchangeAdd(&g_model_depth_biased_vertices, (LONG)changed);
+  }
   return changed;
 }
 
@@ -1159,9 +1226,51 @@ static DWORD ApplyModelTexCoordCorrection(D3D9TLVERTEX* vertices, DWORD vertex_c
   return changed;
 }
 
-static DWORD ApplyModelScreenExpansion(D3D9TLVERTEX* vertices, DWORD vertex_count)
+static float SnapModelScreenCoord(float value)
 {
-  if (!g_model_screen_expand || !vertices || vertex_count < 3 || g_model_screen_expand_pixels <= 0.0f)
+  if (g_model_subpixel_grid <= 0.0f)
+    return value;
+
+  const float scaled = value * g_model_subpixel_grid;
+  const int step = (int)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+  const float snapped = (float)step / g_model_subpixel_grid;
+  if (g_model_subpixel_epsilon >= 0.0f &&
+      AbsF(snapped - value) > g_model_subpixel_epsilon)
+    return value;
+  return snapped;
+}
+
+static DWORD ApplyModelSubpixelStabilization(D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!g_model_subpixel_stabilization || !vertices || vertex_count == 0)
+    return 0;
+
+  DWORD changed = 0;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    const float old_x = vertices[i].sx;
+    const float old_y = vertices[i].sy;
+    const float new_x = SnapModelScreenCoord(old_x);
+    const float new_y = SnapModelScreenCoord(old_y);
+    vertices[i].sx = new_x;
+    vertices[i].sy = new_y;
+    if (new_x != old_x)
+      changed++;
+    if (new_y != old_y)
+      changed++;
+  }
+
+  if (changed)
+  {
+    InterlockedIncrement(&g_model_subpixel_stabilized_draws);
+    InterlockedExchangeAdd(&g_model_subpixel_stabilized_coords, (LONG)changed);
+  }
+  return changed;
+}
+
+static DWORD ApplyModelScreenExpansion(D3D9TLVERTEX* vertices, DWORD vertex_count, float pixels)
+{
+  if (!vertices || vertex_count < 3 || pixels <= 0.0f)
     return 0;
 
   float center_x = 0.0f;
@@ -1184,11 +1293,38 @@ static DWORD ApplyModelScreenExpansion(D3D9TLVERTEX* vertices, DWORD vertex_coun
       continue;
 
     const float inv_len = 1.0f / (float)sqrt(len_sq);
-    vertices[i].sx += dx * inv_len * g_model_screen_expand_pixels;
-    vertices[i].sy += dy * inv_len * g_model_screen_expand_pixels;
+    vertices[i].sx += dx * inv_len * pixels;
+    vertices[i].sy += dy * inv_len * pixels;
     changed++;
   }
   return changed;
+}
+
+static void ApplyModelVertexTweaks(D3D9TLVERTEX* vertices, DWORD vertex_count,
+                                   const DrawBounds* bounds, int transparent,
+                                   int thin_transparent)
+{
+  DWORD expanded = 0;
+  ApplyModelTexCoordCorrection(vertices, vertex_count);
+
+  if (transparent)
+  {
+    if (thin_transparent)
+      expanded = ApplyModelScreenExpansion(vertices, vertex_count,
+                                           g_transparent_thin_expand_pixels);
+  }
+  else if (g_model_screen_expand)
+  {
+    expanded = ApplyModelScreenExpansion(vertices, vertex_count,
+                                         g_model_screen_expand_pixels);
+  }
+
+  if (thin_transparent && expanded)
+    InterlockedIncrement(&g_transparent_thin_stabilized_draws);
+
+  ApplyModelSubpixelStabilization(vertices, vertex_count);
+  ApplyModelDepth(vertices, vertex_count,
+                  ModelDepthBiasForDraw(bounds, transparent, thin_transparent));
 }
 
 static int CaptureRenderState(void* self, DWORD state, DWORD* value)
@@ -1294,8 +1430,8 @@ static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
 }
 
 static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc orig, DWORD primitive_type,
-                                             UINT primitive_count, const void* vertex_data, UINT vertex_stride,
-                                             DWORD vertex_count)
+                                              UINT primitive_count, const void* vertex_data, UINT vertex_stride,
+                                              DWORD vertex_count, const DrawBounds* bounds)
 {
   D3D9StateSnapshot snapshot;
   CaptureState(self, &snapshot);
@@ -1311,9 +1447,7 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   }
 
   memcpy(copy, vertex_data, bytes);
-  ApplyModelTexCoordCorrection(copy, vertex_count);
-  ApplyModelScreenExpansion(copy, vertex_count);
-  ApplyModelDepth(copy, vertex_count);
+  ApplyModelVertexTweaks(copy, vertex_count, bounds, 0, 0);
 
   ForceModelState(self, &snapshot);
   HRESULT hr = orig(self, primitive_type, primitive_count, copy, vertex_stride);
@@ -1325,7 +1459,8 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
 static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrimitiveUPProc orig,
                                                         DWORD primitive_type, UINT primitive_count,
                                                         const void* vertex_data, UINT vertex_stride,
-                                                        DWORD vertex_count, int min_alpha)
+                                                        DWORD vertex_count, int min_alpha,
+                                                        const DrawBounds* bounds)
 {
   D3D9StateSnapshot snapshot;
   CaptureState(self, &snapshot);
@@ -1343,9 +1478,8 @@ static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrim
     if (copy)
     {
       memcpy(copy, vertex_data, bytes);
-      ApplyModelTexCoordCorrection(copy, vertex_count);
-      ApplyModelScreenExpansion(copy, vertex_count);
-      ApplyModelDepth(copy, vertex_count);
+      ApplyModelVertexTweaks(copy, vertex_count, bounds, 1,
+                             IsSoftTransparentThinTriangle(bounds));
       draw_vertices = copy;
     }
   }
@@ -1361,7 +1495,8 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
                                                     DWORD primitive_type, UINT min_vertex_index,
                                                     UINT num_vertices, UINT primitive_count,
                                                     const void* index_data, DWORD index_format,
-                                                    const void* vertex_data, UINT vertex_stride)
+                                                    const void* vertex_data, UINT vertex_stride,
+                                                    const DrawBounds* bounds)
 {
   D3D9StateSnapshot snapshot;
   CaptureState(self, &snapshot);
@@ -1378,15 +1513,56 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
   }
 
   memcpy(copy, vertex_data, bytes);
-  ApplyModelTexCoordCorrection(copy, num_vertices);
-  ApplyModelScreenExpansion(copy, num_vertices);
-  ApplyModelDepth(copy, num_vertices);
+  ApplyModelVertexTweaks(copy, num_vertices, bounds, 0, 0);
 
   ForceModelState(self, &snapshot);
   HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                     index_data, index_format, copy, vertex_stride);
   RestoreState(self, &snapshot);
   HeapFree(GetProcessHeap(), 0, copy);
+  return hr;
+}
+
+static HRESULT DrawIndexedPrimitiveUPWithTransparentModelDepth(void* self,
+                                                              D3D9DrawIndexedPrimitiveUPProc orig,
+                                                              DWORD primitive_type,
+                                                              UINT min_vertex_index,
+                                                              UINT num_vertices,
+                                                              UINT primitive_count,
+                                                              const void* index_data,
+                                                              DWORD index_format,
+                                                              const void* vertex_data,
+                                                              UINT vertex_stride,
+                                                              int min_alpha,
+                                                              const DrawBounds* bounds)
+{
+  D3D9StateSnapshot snapshot;
+  CaptureState(self, &snapshot);
+  const int write_depth =
+    g_transparent_model_z_write_soft_opaque && min_alpha >= g_soft_opaque_alpha_min;
+  ForceTransparentModelState(self, &snapshot, write_depth);
+
+  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)num_vertices;
+  D3D9TLVERTEX* copy = NULL;
+  const void* draw_vertices = vertex_data;
+
+  if (g_transparent_model_depth_adjust)
+  {
+    copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (copy)
+    {
+      memcpy(copy, vertex_data, bytes);
+      ApplyModelVertexTweaks(copy, num_vertices, bounds, 1,
+                             IsSoftTransparentThinTriangle(bounds));
+      draw_vertices = copy;
+    }
+  }
+
+  HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
+                    index_data, index_format, draw_vertices, vertex_stride);
+  RestoreState(self, &snapshot);
+  if (copy)
+    HeapFree(GetProcessHeap(), 0, copy);
   return hr;
 }
 
@@ -1431,7 +1607,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
       (void)transparent_reason;
       InterlockedIncrement(&g_dpup_transparent_accepted);
       return DrawPrimitiveUPWithTransparentModelDepth(self, orig, primitive_type, primitive_count,
-                                                     vertex_data, vertex_stride, vertex_count, min_alpha);
+                                                     vertex_data, vertex_stride, vertex_count,
+                                                     min_alpha, &transparent_bounds);
     }
 
     if (reason && strcmp(reason, "alpha") == 0)
@@ -1447,7 +1624,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
 
   InterlockedIncrement(&g_dpup_accepted);
   return DrawPrimitiveUPWithModelDepth(self, orig, primitive_type, primitive_count, vertex_data,
-                                       vertex_stride, vertex_count);
+                                       vertex_stride, vertex_count, &bounds);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetRenderState(void* self, DWORD state, DWORD value)
@@ -1540,6 +1717,25 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   if (!IsModelDepthDraw(indexed, primitive_type, index_count, primitive_count,
                         alpha_blend_enabled, &bounds, &reason))
   {
+    DrawBounds transparent_bounds;
+    int min_alpha = 255;
+    const char* transparent_reason = NULL;
+    if (reason && strcmp(reason, "alpha") == 0 &&
+        IsTransparentModelDepthDraw(indexed, primitive_type, index_count,
+                                    primitive_count, &transparent_bounds, &min_alpha,
+                                    &transparent_reason))
+    {
+      (void)transparent_reason;
+      InterlockedIncrement(&g_dipup_transparent_accepted);
+      HeapFree(GetProcessHeap(), 0, indexed);
+      return DrawIndexedPrimitiveUPWithTransparentModelDepth(self, orig, primitive_type,
+                                                            min_vertex_index, num_vertices,
+                                                            primitive_count, index_data,
+                                                            index_format, vertex_data,
+                                                            vertex_stride, min_alpha,
+                                                            &transparent_bounds);
+    }
+
     InterlockedIncrement(&g_dipup_rejected);
     HeapFree(GetProcessHeap(), 0, indexed);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
@@ -1549,8 +1745,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   InterlockedIncrement(&g_dipup_accepted);
   HeapFree(GetProcessHeap(), 0, indexed);
   return DrawIndexedPrimitiveUPWithModelDepth(self, orig, primitive_type, min_vertex_index,
-                                             num_vertices, primitive_count, index_data,
-                                             index_format, vertex_data, vertex_stride);
+                                              num_vertices, primitive_count, index_data,
+                                              index_format, vertex_data, vertex_stride, &bounds);
 }
 
 static void ClearDepthBufferForScene(void* self)
@@ -1602,15 +1798,21 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
       (g_frame_summary_interval > 0 && (frame % g_frame_summary_interval) == 0))
   {
     LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld transparent=%ld "
-            "dipup=%ld dipupAccepted=%ld dipupRejected=%ld depthClear=%ld depthFail=%ld "
-            "uvDraws=%ld uvCoords=%ld "
+            "dipup=%ld dipupAccepted=%ld dipupTransparent=%ld dipupRejected=%ld "
+            "depthClear=%ld depthFail=%ld uvDraws=%ld uvCoords=%ld "
+            "subpixDraws=%ld subpixCoords=%ld depthBiasDraws=%ld depthBiasVerts=%ld "
+            "thinTransparent=%ld "
             "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
             "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p curFVF=0x%lX "
             "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
             frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
             g_dpup_transparent_accepted, g_dipup_total, g_dipup_accepted,
-            g_dipup_rejected, g_depth_clear_count, g_depth_clear_failures,
+            g_dipup_transparent_accepted, g_dipup_rejected,
+            g_depth_clear_count, g_depth_clear_failures,
             g_model_uv_corrected_draws, g_model_uv_corrected_coords,
+            g_model_subpixel_stabilized_draws, g_model_subpixel_stabilized_coords,
+            g_model_depth_biased_draws, g_model_depth_biased_vertices,
+            g_transparent_thin_stabilized_draws,
             g_dpup_stride_rejected, g_dpup_alpha_rejected, g_dpup_axis_rejected,
             g_dpup_rhw_rejected, g_dpup_other_rejected,
             g_set_texture_calls, g_set_texture0_changes, g_set_fvf_calls,
@@ -1755,6 +1957,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
     LogLine("re3_zfix loaded");
+    LogLine("model-tweaks subpixel=%d grid=%.1f eps=%.4f depthBias=%d opaque=%.7f "
+            "transparent=%.7f thinTransparent=%.7f thinExpand=%.3f",
+            g_model_subpixel_stabilization, g_model_subpixel_grid,
+            g_model_subpixel_epsilon, g_model_depth_bias_enabled,
+            g_model_depth_bias, g_transparent_model_depth_bias,
+            g_transparent_thin_depth_bias, g_transparent_thin_expand_pixels);
     PatchAllImports();
   }
   return TRUE;

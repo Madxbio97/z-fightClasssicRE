@@ -22,6 +22,11 @@ focused on model depth precision and polygon seam cleanup.
 - Clears the owned depth surface at the start of each scene.
 - Keeps UV coordinate correction, while removing old CSV/callsite tracing,
   disabled depth-normalization experiments, and the disabled prepass path.
+- Applies model-only subpixel stabilization and tiny per-draw depth bias to
+  reduce shimmer without changing UI/background layers.
+- Lets thin transparent model triangles use a softer z-tested path with very
+  small screen expansion and a gentler depth bias, instead of rejecting every
+  spike-like shape outright.
 
 ## Build
 
