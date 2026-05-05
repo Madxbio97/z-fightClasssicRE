@@ -1,7 +1,7 @@
 # z-fightClassicRE
 
 ASI plugins for the classic PC releases of Resident Evil 2 and Resident Evil 3,
-focused on model depth precision and polygon seam cleanup.
+plus Dino Crisis 1, focused on model depth precision and polygon stability.
 
 ## Targets
 
@@ -35,6 +35,17 @@ focused on model depth precision and polygon seam cleanup.
   small screen expansion and a gentler depth bias, instead of rejecting every
   spike-like shape outright.
 
+### Dino Crisis 1
+
+- Uses the same DirectDraw-to-D3D9 hook family as the RE3 Classic Rebirth
+  target, but ships as a separate `dc1_zfix.asi`.
+- Treats the game as a polygonal 3D scene instead of a prerender-background
+  game: the screen/rhw limits are wider so level geometry can enter the stable
+  geometry path.
+- Adds quarter-pixel vertex stabilization and a wider center-anchor snap for
+  distant or mid-size polygons, reducing camera-turn geometry shimmer while
+  avoiding flat UI overlays.
+
 ## Build
 
 ```powershell
@@ -46,6 +57,7 @@ Build a single target:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re2
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re3
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target dc1
 ```
 
 By default the script uses `D:\Tools\zig\zig-x86_64-windows-0.16.0\zig.exe`.
@@ -60,6 +72,7 @@ Outputs:
 
 - `re2_zfix.asi`
 - `re3_zfix.asi`
+- `dc1_zfix.asi`
 
 Copy the matching ASI next to the game executable and load it through the
 existing ASI loader.

@@ -1,5 +1,5 @@
 param(
-  [ValidateSet('all', 're2', 're3')]
+  [ValidateSet('all', 're2', 're3', 'dc1')]
   [string]$Target = 'all'
 )
 
@@ -38,4 +38,7 @@ if ($Target -eq 'all' -or $Target -eq 're2') {
 }
 if ($Target -eq 'all' -or $Target -eq 're3') {
   Build-Asi 're3_zfix'
+}
+if ($Target -eq 'all' -or $Target -eq 'dc1') {
+  Build-Asi 'dc1_zfix'
 }
