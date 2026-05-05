@@ -900,6 +900,38 @@ static int HasModelRhwRange(const DrawBounds* bounds)
   return 1;
 }
 
+static int IsSupportedModelPrimitive(DWORD primitive_type)
+{
+  return primitive_type == D3DPT_TRIANGLELIST ||
+         primitive_type == D3DPT_TRIANGLESTRIP ||
+         primitive_type == D3DPT_TRIANGLEFAN;
+}
+
+static int ExceedsModelScreenLimits(const DrawBounds* bounds)
+{
+  if (!bounds)
+    return 1;
+  if (g_max_screen_extent > 0.0f &&
+      (bounds->width > g_max_screen_extent || bounds->height > g_max_screen_extent))
+    return 1;
+  if (g_max_screen_area > 0.0f && bounds->area > g_max_screen_area)
+    return 1;
+  return 0;
+}
+
+static int HasValidModelDepthRange(const DrawBounds* bounds)
+{
+  return bounds && bounds->min_z >= 0.0f && bounds->max_z <= 1.0f;
+}
+
+static int HasUsableModelDepthVariance(const DrawBounds* bounds)
+{
+  if (!bounds)
+    return 0;
+  return (bounds->max_z - bounds->min_z) >= g_min_depth_variance ||
+         (bounds->max_rhw - bounds->min_rhw) >= g_min_rhw_variance;
+}
+
 static int IsSpikeLikeTriangle(const DrawBounds* bounds)
 {
   if (!bounds)
@@ -978,9 +1010,7 @@ static int IsTransparentModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primi
       *reason = "transparent_off";
     return 0;
   }
-  if (primitive_type != D3DPT_TRIANGLELIST &&
-      primitive_type != D3DPT_TRIANGLESTRIP &&
-      primitive_type != D3DPT_TRIANGLEFAN)
+  if (!IsSupportedModelPrimitive(primitive_type))
   {
     if (reason)
       *reason = "transparent_primitive";
@@ -1009,20 +1039,13 @@ static int IsTransparentModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primi
     return 0;
   }
 
-  if (g_max_screen_extent > 0.0f &&
-      (local_bounds.width > g_max_screen_extent || local_bounds.height > g_max_screen_extent))
+  if (ExceedsModelScreenLimits(&local_bounds))
   {
     if (reason)
-      *reason = "transparent_large_extent";
+      *reason = "transparent_large";
     return 0;
   }
-  if (g_max_screen_area > 0.0f && local_bounds.area > g_max_screen_area)
-  {
-    if (reason)
-      *reason = "transparent_large_area";
-    return 0;
-  }
-  if (local_bounds.min_z < 0.0f || local_bounds.max_z > 1.0f)
+  if (!HasValidModelDepthRange(&local_bounds))
   {
     if (reason)
       *reason = "transparent_z_range";
@@ -1042,9 +1065,7 @@ static int IsTransparentModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primi
     return 0;
   }
 
-  const float z_span = local_bounds.max_z - local_bounds.min_z;
-  const float rhw_span = local_bounds.max_rhw - local_bounds.min_rhw;
-  if (z_span < g_min_depth_variance && rhw_span < g_min_rhw_variance)
+  if (!HasUsableModelDepthVariance(&local_bounds))
   {
     if (reason)
       *reason = "transparent_flat";
@@ -1065,9 +1086,7 @@ static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, 
       *reason = "off";
     return 0;
   }
-  if (primitive_type != D3DPT_TRIANGLELIST &&
-      primitive_type != D3DPT_TRIANGLESTRIP &&
-      primitive_type != D3DPT_TRIANGLEFAN)
+  if (!IsSupportedModelPrimitive(primitive_type))
   {
     if (reason)
       *reason = "primitive";
@@ -1093,20 +1112,13 @@ static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, 
     return 0;
   }
 
-  if (g_max_screen_extent > 0.0f &&
-      (local_bounds.width > g_max_screen_extent || local_bounds.height > g_max_screen_extent))
+  if (ExceedsModelScreenLimits(&local_bounds))
   {
     if (reason)
-      *reason = "large_extent";
+      *reason = "large";
     return 0;
   }
-  if (g_max_screen_area > 0.0f && local_bounds.area > g_max_screen_area)
-  {
-    if (reason)
-      *reason = "large_area";
-    return 0;
-  }
-  if (local_bounds.min_z < 0.0f || local_bounds.max_z > 1.0f)
+  if (!HasValidModelDepthRange(&local_bounds))
   {
     if (reason)
       *reason = "z_range";
@@ -1125,9 +1137,7 @@ static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, 
     return 0;
   }
 
-  const float z_span = local_bounds.max_z - local_bounds.min_z;
-  const float rhw_span = local_bounds.max_rhw - local_bounds.min_rhw;
-  if (z_span < g_min_depth_variance && rhw_span < g_min_rhw_variance)
+  if (!HasUsableModelDepthVariance(&local_bounds))
   {
     if (reason)
       *reason = "flat";
@@ -1331,6 +1341,12 @@ static int CaptureRenderState(void* self, DWORD state, DWORD* value)
 {
   D3D9GetRenderStateProc get_rs = (D3D9GetRenderStateProc)GetVTableSlot(self, 58);
   return get_rs && SUCCEEDED(get_rs(self, state, value));
+}
+
+static int CaptureAlphaBlendEnabled(void* self)
+{
+  DWORD alpha_blend = 0;
+  return CaptureRenderState(self, D3DRS_ALPHABLENDENABLE, &alpha_blend) && alpha_blend != 0;
 }
 
 static int CaptureSamplerState(void* self, DWORD sampler, DWORD type, DWORD* value)
@@ -1589,12 +1605,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
   }
 
   DrawBounds bounds;
-  DWORD alpha_blend = 0;
-  const int alpha_blend_enabled =
-    CaptureRenderState(self, D3DRS_ALPHABLENDENABLE, &alpha_blend) && alpha_blend != 0;
   const char* reason = NULL;
   if (!IsModelDepthDraw((const D3D9TLVERTEX*)vertex_data, primitive_type, vertex_count, primitive_count,
-                        alpha_blend_enabled, &bounds, &reason))
+                        CaptureAlphaBlendEnabled(self), &bounds, &reason))
   {
     DrawBounds transparent_bounds;
     int min_alpha = 255;
@@ -1710,12 +1723,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   }
 
   DrawBounds bounds;
-  DWORD alpha_blend = 0;
-  const int alpha_blend_enabled =
-    CaptureRenderState(self, D3DRS_ALPHABLENDENABLE, &alpha_blend) && alpha_blend != 0;
   const char* reason = NULL;
   if (!IsModelDepthDraw(indexed, primitive_type, index_count, primitive_count,
-                        alpha_blend_enabled, &bounds, &reason))
+                        CaptureAlphaBlendEnabled(self), &bounds, &reason))
   {
     DrawBounds transparent_bounds;
     int min_alpha = 255;

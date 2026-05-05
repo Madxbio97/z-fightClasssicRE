@@ -195,12 +195,6 @@ typedef struct DrawBounds {
   float area;
 } DrawBounds;
 
-typedef struct DepthRangeMap {
-  float min_z;
-  float max_z;
-  int valid;
-} DepthRangeMap;
-
 typedef struct DepthStateSnapshot {
   DWORD z_enable;
   DWORD z_write;
@@ -311,8 +305,6 @@ static const int g_diagnostics = 1;
 static const int g_callsite_diagnostics = 1;
 static const int g_lower_level_probe = 0;
 static const int g_precise_model_depth_pass = 1;
-static const int g_model_depth_normalize = 0;
-static const int g_model_depth_centered = 1;
 static const int g_force_z_enable = 1;
 static const int g_force_z_write = 1;
 static const int g_force_z_func = D3DCMP_LESSEQUAL;
@@ -328,9 +320,7 @@ static const int g_reject_alpha_only_when_blending = 1;
 static const int g_single_triangle_dp_only = 1;
 static const int g_allow_indexed_model_draws = 1;
 static const int g_require_model_callsite = 1;
-static const int g_use_previous_depth_range = 0;
 static const int g_clear_model_depth_before_2d = 1;
-static const int g_close_model_depth_softening = 0;
 static const int g_transparent_model_z_test = 1;
 static const int g_transparent_model_depth_adjust = 0;
 static const int g_transparent_model_z_write = 0;
@@ -363,24 +353,7 @@ static const float g_spike_long_extent = 260.0f;
 static const float g_spike_thin_extent = 2.0f;
 static const float g_min_depth_variance = 0.000001f;
 static const float g_min_rhw_variance = 0.00000001f;
-static const float g_model_depth_near = 0.12f;
-static const float g_model_depth_far = 0.88f;
-static const float g_model_depth_min_span = 0.00005f;
 static const float g_model_depth_bias = 0.0f;
-static const float g_model_depth_range_padding = 0.020f;
-static const float g_model_depth_range_floor = 0.12f;
-static const float g_model_depth_blend = 0.34f;
-static const float g_model_depth_max_expansion = 1.78f;
-static const float g_model_depth_centered_scale = 1.78f;
-static const float g_model_depth_centered_min = 0.0001f;
-static const float g_model_depth_centered_max = 0.9990f;
-static const float g_previous_depth_center_tolerance = 0.10f;
-static const float g_close_model_rhw_start = 0.0010f;
-static const float g_close_model_rhw_end = 0.0060f;
-static const float g_close_model_extent_start = 96.0f;
-static const float g_close_model_extent_end = 320.0f;
-static const float g_close_model_blend_scale = 0.35f;
-static const float g_close_model_max_expansion = 1.10f;
 static const float g_model_uv_snap_grid = 255.0f;
 static const float g_model_uv_center_grid = 256.0f;
 static const float g_model_uv_snap_epsilon = 0.015f;
@@ -399,10 +372,6 @@ static const float g_crow_wing_depth_max_span = 0.000380f;
 static const float g_crow_wing_depth_max_shift = 0.000160f;
 static const float g_zfight_tiny_span = 0.000080f;
 static const float g_zfight_tiny_delta = 0.000030f;
-static float g_model_z_min_current = 1.0e30f;
-static float g_model_z_max_current = -1.0e30f;
-static float g_model_z_min_previous = 0.0f;
-static float g_model_z_max_previous = 1.0f;
 static const DWORD g_model_callsite_min = 0x0040E000u;
 static const DWORD g_model_callsite_max = 0x0040F800u;
 static const DWORD g_re2_batched_model_callsite = 0x004080D8u;
@@ -443,8 +412,6 @@ static DWORD g_rs_z_func = 0xFFFFFFFFu;
 static DWORD g_rs_z_bias = 0xFFFFFFFFu;
 static DWORD g_rs_alpha_blend = 0xFFFFFFFFu;
 static DWORD g_render_state_cache[256];
-static int g_model_z_current_valid = 0;
-static int g_model_z_previous_valid = 0;
 static int g_model_depth_written_this_scene = 0;
 
 // Forward declarations.
@@ -726,8 +693,8 @@ static void MarkCallsiteTinyDelta(DWORD caller)
 
 static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD primitive_type,
                             DWORD vertex_count, DWORD index_count, const DrawBounds* before,
-                            const DrawBounds* after, const DepthRangeMap* map,
-                            DWORD model_changed, DWORD secondary_changed, DWORD targeted_changed)
+                            const DrawBounds* after, DWORD model_changed,
+                            DWORD secondary_changed, DWORD targeted_changed)
 {
   if (!before || !after)
     return;
@@ -751,14 +718,13 @@ static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD p
   ResolveModuleForAddress(caller, &info);
   LogLine("zfight-sample #%ld %s caller=%s+0x%08lX indexed=%d type=%lu verts=%lu indices=%lu "
           "model=%lu secondary=%lu targeted=%lu z %.6f..%.6f span=%.8f -> %.6f..%.6f span=%.8f "
-          "rhw=[%.8f..%.8f] xy=[%.2f..%.2f %.2f..%.2f] map=%d %.6f..%.6f",
+          "rhw=[%.8f..%.8f] xy=[%.2f..%.2f %.2f..%.2f]",
           sample, kind ? kind : "draw", info.module_name, info.module_offset, indexed,
           primitive_type, vertex_count, index_count, model_changed, secondary_changed, targeted_changed,
           before->min_z, before->max_z, before_span,
           after->min_z, after->max_z, after_span,
           before->min_rhw, before->max_rhw,
-          before->min_x, before->max_x, before->min_y, before->max_y,
-          map && map->valid, map ? map->min_z : 0.0f, map ? map->max_z : 0.0f);
+          before->min_x, before->max_x, before->min_y, before->max_y);
 }
 
 static void LogDrawCallsiteSummary(const char* reason)
@@ -823,11 +789,6 @@ static float Clamp01(float v)
   if (v > 1.0f)
     return 1.0f;
   return v;
-}
-
-static float LerpF(float a, float b, float t)
-{
-  return a + ((b - a) * t);
 }
 
 static int NearF(float a, float b, float eps)
@@ -1558,244 +1519,20 @@ static int IsTransparentIndexedModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices
   return 1;
 }
 
-// Model depth remapping.
-static void ResetCurrentModelDepthRange(void)
-{
-  g_model_z_min_current = 1.0e30f;
-  g_model_z_max_current = -1.0e30f;
-  g_model_z_current_valid = 0;
-}
-
-static void ExpandModelDepthRange(float min_z, float max_z)
-{
-  if (min_z < 0.0f || max_z > 1.0f || max_z < min_z)
-    return;
-
-  if (!g_model_z_current_valid)
-  {
-    g_model_z_min_current = min_z;
-    g_model_z_max_current = max_z;
-    g_model_z_current_valid = 1;
-    return;
-  }
-
-  if (min_z < g_model_z_min_current)
-    g_model_z_min_current = min_z;
-  if (max_z > g_model_z_max_current)
-    g_model_z_max_current = max_z;
-}
-
-static void AddRangeToMap(DepthRangeMap* map, float min_z, float max_z)
-{
-  if (!map || min_z < 0.0f || max_z > 1.0f || max_z < min_z)
-    return;
-
-  if (!map->valid)
-  {
-    map->min_z = min_z;
-    map->max_z = max_z;
-    map->valid = 1;
-    return;
-  }
-
-  if (min_z < map->min_z)
-    map->min_z = min_z;
-  if (max_z > map->max_z)
-    map->max_z = max_z;
-}
-
-static void PadAndFloorDepthMap(DepthRangeMap* map)
-{
-  if (!map || !map->valid)
-    return;
-
-  map->min_z -= g_model_depth_range_padding;
-  map->max_z += g_model_depth_range_padding;
-  if (map->min_z < 0.0f)
-    map->min_z = 0.0f;
-  if (map->max_z > 1.0f)
-    map->max_z = 1.0f;
-
-  float span = map->max_z - map->min_z;
-  if (g_model_depth_range_floor > 0.0f && span < g_model_depth_range_floor)
-  {
-    const float center = (map->min_z + map->max_z) * 0.5f;
-    const float half = g_model_depth_range_floor * 0.5f;
-    map->min_z = center - half;
-    map->max_z = center + half;
-
-    if (map->min_z < 0.0f)
-    {
-      map->max_z -= map->min_z;
-      map->min_z = 0.0f;
-    }
-    if (map->max_z > 1.0f)
-    {
-      const float over = map->max_z - 1.0f;
-      map->min_z -= over;
-      map->max_z = 1.0f;
-      if (map->min_z < 0.0f)
-        map->min_z = 0.0f;
-    }
-  }
-}
-
-static DepthRangeMap BuildDepthMapForDraw(const DrawBounds* bounds)
-{
-  DepthRangeMap map;
-  map.min_z = 0.0f;
-  map.max_z = 1.0f;
-  map.valid = 0;
-
-  if (g_use_previous_depth_range && g_model_z_previous_valid)
-  {
-    int use_previous = 1;
-    if (bounds)
-    {
-      const float previous_center = (g_model_z_min_previous + g_model_z_max_previous) * 0.5f;
-      const float draw_center = (bounds->min_z + bounds->max_z) * 0.5f;
-      if (AbsF(previous_center - draw_center) > g_previous_depth_center_tolerance)
-        use_previous = 0;
-    }
-
-    if (use_previous)
-      AddRangeToMap(&map, g_model_z_min_previous, g_model_z_max_previous);
-  }
-  if (g_model_z_current_valid)
-    AddRangeToMap(&map, g_model_z_min_current, g_model_z_max_current);
-  if (bounds)
-    AddRangeToMap(&map, bounds->min_z, bounds->max_z);
-
-  PadAndFloorDepthMap(&map);
-  if (!map.valid || (map.max_z - map.min_z) < g_model_depth_min_span)
-    map.valid = 0;
-  return map;
-}
-
-static float CloseModelFactorForBounds(const DrawBounds* bounds)
-{
-  if (!g_close_model_depth_softening || !bounds)
-    return 0.0f;
-
-  const float rhw_factor =
-    Clamp01((bounds->max_rhw - g_close_model_rhw_start) /
-            (g_close_model_rhw_end - g_close_model_rhw_start));
-  const float extent = bounds->width > bounds->height ? bounds->width : bounds->height;
-  const float extent_factor =
-    Clamp01((extent - g_close_model_extent_start) /
-            (g_close_model_extent_end - g_close_model_extent_start));
-  return rhw_factor > extent_factor ? rhw_factor : extent_factor;
-}
-
-static float EffectiveDepthBlendForSpan(float map_span, const DrawBounds* bounds)
-{
-  float blend = g_model_depth_blend;
-  const float close_factor = CloseModelFactorForBounds(bounds);
-  float max_expansion = g_model_depth_max_expansion;
-
-  if (close_factor > 0.0f)
-  {
-    blend *= LerpF(1.0f, g_close_model_blend_scale, close_factor);
-    max_expansion = LerpF(g_model_depth_max_expansion, g_close_model_max_expansion, close_factor);
-  }
-
-  const float target_span = g_model_depth_far - g_model_depth_near;
-  if (map_span <= 0.0f || target_span <= 0.0f || max_expansion <= 1.0f)
-    return blend;
-
-  const float normalized_scale = target_span / map_span;
-  if (normalized_scale <= max_expansion || normalized_scale <= 1.0f)
-    return blend;
-
-  float max_blend = (max_expansion - 1.0f) / (normalized_scale - 1.0f);
-  if (max_blend < 0.0f)
-    max_blend = 0.0f;
-  if (max_blend > 1.0f)
-    max_blend = 1.0f;
-  if (blend > max_blend)
-    blend = max_blend;
-  return blend;
-}
-
-static float EffectiveCenteredDepthScale(const DrawBounds* bounds)
-{
-  float scale = g_model_depth_centered_scale;
-  const float close_factor = CloseModelFactorForBounds(bounds);
-
-  if (close_factor > 0.0f)
-  {
-    scale = LerpF(g_model_depth_centered_scale, g_close_model_max_expansion, close_factor);
-  }
-
-  if (scale < 1.0f)
-    scale = 1.0f;
-  if (scale > g_model_depth_max_expansion)
-    scale = g_model_depth_max_expansion;
-  return scale;
-}
-
-static DWORD ApplyModelDepth(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count, const DepthRangeMap* map,
-                             const DrawBounds* bounds)
+// Model depth adjustment.
+static DWORD ApplyModelDepth(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count)
 {
   if (!vertices || vertex_count == 0)
     return 0;
 
   DWORD changed = 0;
-  const int normalize = g_model_depth_normalize && map && map->valid &&
-                        g_model_depth_far > g_model_depth_near;
-  const float span = normalize ? (map->max_z - map->min_z) : 1.0f;
-  float effective_scale = (normalize && span >= g_model_depth_min_span && g_model_depth_centered) ?
-                          EffectiveCenteredDepthScale(bounds) : 1.0f;
-  const float effective_blend = (normalize && span >= g_model_depth_min_span && !g_model_depth_centered) ?
-                                EffectiveDepthBlendForSpan(span, bounds) : 0.0f;
-  float input_min = vertices[0].sz;
-  float input_max = vertices[0].sz;
-  for (DWORD i = 1; i < vertex_count; i++)
-  {
-    if (vertices[i].sz < input_min)
-      input_min = vertices[i].sz;
-    if (vertices[i].sz > input_max)
-      input_max = vertices[i].sz;
-  }
-  const float centered_depth_center = (input_min + input_max) * 0.5f;
-  if (normalize && span >= g_model_depth_min_span && g_model_depth_centered)
-  {
-    const float below_center = centered_depth_center - input_min;
-    const float above_center = input_max - centered_depth_center;
-    if (below_center > 0.0f)
-    {
-      const float max_scale_low = (centered_depth_center - g_model_depth_centered_min) / below_center;
-      if (max_scale_low < effective_scale)
-        effective_scale = max_scale_low;
-    }
-    if (above_center > 0.0f)
-    {
-      const float max_scale_high = (g_model_depth_centered_max - centered_depth_center) / above_center;
-      if (max_scale_high < effective_scale)
-        effective_scale = max_scale_high;
-    }
-    if (effective_scale < 0.0f)
-      effective_scale = 0.0f;
-  }
   for (DWORD i = 0; i < vertex_count; i++)
   {
     const float original_z = vertices[i].sz;
-    float z = original_z;
-    if (normalize && span >= g_model_depth_min_span)
-    {
-      if (g_model_depth_centered)
-      {
-        z = centered_depth_center + ((original_z - centered_depth_center) * effective_scale);
-      }
-      else
-      {
-        const float t = (z - map->min_z) / span;
-        const float mapped = g_model_depth_near + (t * (g_model_depth_far - g_model_depth_near));
-        z = original_z + ((mapped - original_z) * effective_blend);
-      }
-    }
-    vertices[i].sz = ClampDepth(z + g_model_depth_bias);
-    changed++;
+    const float new_z = ClampDepth(original_z + g_model_depth_bias);
+    vertices[i].sz = new_z;
+    if (new_z != original_z)
+      changed++;
   }
 
   return changed;
@@ -1851,6 +1588,12 @@ static DWORD TrackedRenderStateValue(DWORD state)
     default:
       return 0xFFFFFFFFu;
   }
+}
+
+static int IsTrackedAlphaBlendEnabled(void)
+{
+  const DWORD alpha_blend = TrackedRenderStateValue(D3DRENDERSTATE_ALPHABLENDENABLE);
+  return alpha_blend != 0 && alpha_blend != 0xFFFFFFFFu;
 }
 
 // Targeted model fixes.
@@ -2220,7 +1963,6 @@ static void ClearModelDepthBeforeKnown2D(void* self, DWORD caller, DWORD vertex_
 
   ClearDepthBuffer(self);
   g_model_depth_written_this_scene = 0;
-  ResetCurrentModelDepthRange();
 }
 
 static void CaptureBatchRenderState(void* self, BatchRenderState* state)
@@ -2334,9 +2076,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
 
   memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
   ApplyModelTexCoordCorrection(copy, vertex_count);
-  ExpandModelDepthRange(bounds->min_z, bounds->max_z);
-  const DepthRangeMap map = BuildDepthMapForDraw(bounds);
-  const DWORD model_changed = ApplyModelDepth(copy, vertex_count, &map, bounds);
+  const DWORD model_changed = ApplyModelDepth(copy, vertex_count);
   DrawBounds adjusted_bounds;
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   const DWORD crow_wing_changed =
@@ -2344,7 +2084,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
   if (crow_wing_changed)
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   LogZFightSample(caller, "opaque-dp", 0, primitive_type, vertex_count, 0,
-                  bounds, &adjusted_bounds, &map, model_changed, 0, crow_wing_changed);
+                  bounds, &adjusted_bounds, model_changed, 0, crow_wing_changed);
 
   RunModelDepthPrepass(self, orig, primitive_type, vertex_type, copy, vertex_count, flags);
   ForceDepthStateForDraw(self);
@@ -2379,14 +2119,12 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
 
   memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
   ApplyModelTexCoordCorrection(copy, vertex_count);
-  ExpandModelDepthRange(bounds->min_z, bounds->max_z);
-  const DepthRangeMap map = BuildDepthMapForDraw(bounds);
-  const DWORD model_changed = ApplyModelDepth(copy, vertex_count, &map, bounds);
+  const DWORD model_changed = ApplyModelDepth(copy, vertex_count);
   DrawBounds adjusted_bounds;
   if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   LogZFightSample(caller, "opaque-dip", 1, primitive_type, vertex_count, index_count,
-                  bounds, &adjusted_bounds, &map, model_changed, 0, 0);
+                  bounds, &adjusted_bounds, model_changed, 0, 0);
 
   RunIndexedModelDepthPrepass(self, orig, primitive_type, vertex_type, copy,
                               vertex_count, indices, index_count, flags);
@@ -2925,7 +2663,6 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DTexture2_GetHandle(void* self, void* de
 static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_BeginScene(void* self)
 {
   g_model_depth_written_this_scene = 0;
-  ResetCurrentModelDepthRange();
   ClearDepthBufferForScene(self);
   D3DDevice2BeginSceneProc orig = (D3DDevice2BeginSceneProc)GetOriginal(*(void***)self, 10);
   return orig ? orig(self) : D3D_OK;
@@ -2973,10 +2710,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   const DWORD tris = TriangleCount(primitive_type, vertex_count);
   DrawBounds bounds;
   const char* reason = NULL;
-  const DWORD alpha_blend = TrackedRenderStateValue(D3DRENDERSTATE_ALPHABLENDENABLE);
-  const int alpha_blend_enabled = alpha_blend != 0 && alpha_blend != 0xFFFFFFFFu;
   const int model_ok = IsModelDepthDraw((const D3DTLVERTEX_COMPAT*)vertices, primitive_type, vertex_count, tris,
-                                        0, alpha_blend_enabled, caller, &bounds, &reason);
+                                        0, IsTrackedAlphaBlendEnabled(), caller, &bounds, &reason);
   if (!model_ok)
   {
     DrawBounds transparent_bounds;
@@ -3032,11 +2767,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   DrawBounds bounds;
   const char* reason = NULL;
   const int indices_ok = IndicesAreValid(indices, index_count, vertex_count);
-  const DWORD alpha_blend = TrackedRenderStateValue(D3DRENDERSTATE_ALPHABLENDENABLE);
-  const int alpha_blend_enabled = alpha_blend != 0 && alpha_blend != 0xFFFFFFFFu;
   const int model_ok = indices_ok &&
                        IsIndexedModelDepthDraw((const D3DTLVERTEX_COMPAT*)vertices, primitive_type, vertex_count,
-                                               indices, index_count, tris, alpha_blend_enabled,
+                                               indices, index_count, tris, IsTrackedAlphaBlendEnabled(),
                                                caller, &bounds, &reason);
   if (!model_ok)
   {
