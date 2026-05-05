@@ -319,11 +319,12 @@ static const int g_force_z_func = D3DCMP_LESSEQUAL;
 static const int g_force_z_bias = 0;
 static const int g_model_depth_prepass = 1;
 static const int g_model_color_pass_z_write = 0;
-static const int g_model_color_pass_z_func = D3DCMP_EQUAL;
+static const int g_model_color_pass_z_func = D3DCMP_LESSEQUAL;
 static const int g_restore_depth_state = 1;
 static const int g_clear_depth_each_scene = 1;
 static const int g_skip_axis_tile_draws = 1;
 static const int g_precise_min_vertex_alpha = 250;
+static const int g_reject_alpha_only_when_blending = 1;
 static const int g_single_triangle_dp_only = 1;
 static const int g_allow_indexed_model_draws = 1;
 static const int g_require_model_callsite = 1;
@@ -350,6 +351,7 @@ static const int g_preferred_zbuffer_depth = 32;
 static const int g_fallback_zbuffer_depth = 24;
 static const int g_texture_handle_trace = 1;
 static const int g_crow_wing_depth_fix = 1;
+static const int g_crow_wing_require_texture_trace = 1;
 
 static const float g_max_screen_extent = 360.0f;
 static const float g_max_screen_area = 60000.0f;
@@ -1147,7 +1149,8 @@ static void LogFlatDepthReject(DWORD caller, const char* label, const DrawBounds
 }
 
 static int IsModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices, DWORD primitive_type, DWORD vertex_count, DWORD tris,
-                            int indexed, DWORD caller, DrawBounds* bounds, const char** reason)
+                            int indexed, int alpha_blend_enabled, DWORD caller,
+                            DrawBounds* bounds, const char** reason)
 {
   if (reason)
     *reason = "ok";
@@ -1198,7 +1201,8 @@ static int IsModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices, DWORD primitive_
       *reason = "axis_tile";
     return 0;
   }
-  if (HasTransparentVertex(vertices, vertex_count))
+  if ((!g_reject_alpha_only_when_blending || alpha_blend_enabled) &&
+      HasTransparentVertex(vertices, vertex_count))
   {
     if (reason)
       *reason = "vertex_alpha";
@@ -1257,8 +1261,9 @@ static int IsModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices, DWORD primitive_
 }
 
 static int IsIndexedModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices, DWORD primitive_type, DWORD vertex_count,
-                                   const WORD* indices, DWORD index_count, DWORD tris,
-                                   DWORD caller, DrawBounds* bounds, const char** reason)
+                                    const WORD* indices, DWORD index_count, DWORD tris,
+                                    int alpha_blend_enabled, DWORD caller,
+                                    DrawBounds* bounds, const char** reason)
 {
   if (reason)
     *reason = "ok";
@@ -1293,7 +1298,8 @@ static int IsIndexedModelDepthDraw(const D3DTLVERTEX_COMPAT* vertices, DWORD pri
       *reason = "axis_tile";
     return 0;
   }
-  if (HasTransparentIndexedVertex(vertices, vertex_count, indices, index_count))
+  if ((!g_reject_alpha_only_when_blending || alpha_blend_enabled) &&
+      HasTransparentIndexedVertex(vertices, vertex_count, indices, index_count))
   {
     if (reason)
       *reason = "vertex_alpha";
@@ -1838,6 +1844,8 @@ static DWORD TrackedRenderStateValue(DWORD state)
       return g_rs_z_write;
     case D3DRENDERSTATE_ZFUNC:
       return g_rs_z_func;
+    case D3DRENDERSTATE_ALPHABLENDENABLE:
+      return g_rs_alpha_blend;
     case D3DRENDERSTATE_ZBIAS:
       return g_rs_z_bias;
     default:
@@ -1854,7 +1862,7 @@ static int CurrentTextureMatchesCrowWing(void)
 
   const TextureHandleTrace* texture_trace = FindTextureHandleTraceByHandle(texture);
   if (!texture_trace)
-    return 1;
+    return !g_crow_wing_require_texture_trace;
 
   if (g_crow_wing_texture_width && texture_trace->width &&
       texture_trace->width != g_crow_wing_texture_width)
@@ -2965,8 +2973,10 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   const DWORD tris = TriangleCount(primitive_type, vertex_count);
   DrawBounds bounds;
   const char* reason = NULL;
+  const DWORD alpha_blend = TrackedRenderStateValue(D3DRENDERSTATE_ALPHABLENDENABLE);
+  const int alpha_blend_enabled = alpha_blend != 0 && alpha_blend != 0xFFFFFFFFu;
   const int model_ok = IsModelDepthDraw((const D3DTLVERTEX_COMPAT*)vertices, primitive_type, vertex_count, tris,
-                                        0, caller, &bounds, &reason);
+                                        0, alpha_blend_enabled, caller, &bounds, &reason);
   if (!model_ok)
   {
     DrawBounds transparent_bounds;
@@ -3022,9 +3032,12 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   DrawBounds bounds;
   const char* reason = NULL;
   const int indices_ok = IndicesAreValid(indices, index_count, vertex_count);
+  const DWORD alpha_blend = TrackedRenderStateValue(D3DRENDERSTATE_ALPHABLENDENABLE);
+  const int alpha_blend_enabled = alpha_blend != 0 && alpha_blend != 0xFFFFFFFFu;
   const int model_ok = indices_ok &&
                        IsIndexedModelDepthDraw((const D3DTLVERTEX_COMPAT*)vertices, primitive_type, vertex_count,
-                                               indices, index_count, tris, caller, &bounds, &reason);
+                                               indices, index_count, tris, alpha_blend_enabled,
+                                               caller, &bounds, &reason);
   if (!model_ok)
   {
     DrawBounds transparent_bounds;
@@ -3198,15 +3211,16 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
       g_render_state_cache[i] = 0xFFFFFFFFu;
     LogLine("re2_zfix loaded diagnostics=%d lower_probe=%d model_callsite=0x%08lX..0x%08lX",
             g_diagnostics, g_lower_level_probe, g_model_callsite_min, g_model_callsite_max);
-    LogLine("depth zbuffer=%d/%d clearEachScene=%d prepass=%d colorZWrite=%d colorZFunc=%d alphaRef=%lu",
+    LogLine("depth zbuffer=%d/%d clearEachScene=%d prepass=%d colorZWrite=%d colorZFunc=%d alphaRef=%lu alphaRejectBlendOnly=%d",
             g_preferred_zbuffer_depth, g_fallback_zbuffer_depth, g_clear_depth_each_scene,
             g_model_depth_prepass, g_model_color_pass_z_write, g_model_color_pass_z_func,
-            g_model_alpha_ref);
-    LogLine("crow_wing_fix enabled=%d callsite=0x%08lX texture=0x%08lX wh=%lux%lu "
+            g_model_alpha_ref, g_reject_alpha_only_when_blending);
+    LogLine("crow_wing_fix enabled=%d requireTrace=%d callsite=0x%08lX texture=0x%08lX wh=%lux%lu "
             "areaMin=%.1f extent=%.1f..%.1f rhwMax=%.8f rhwSpanMax=%.8f zSpanMax=%.8f "
             "floorSpan=%.8f maxSpan=%.8f maxShift=%.8f",
-            g_crow_wing_depth_fix, g_crow_wing_callsite, g_crow_wing_texture_handle,
-            g_crow_wing_texture_width, g_crow_wing_texture_height,
+            g_crow_wing_depth_fix, g_crow_wing_require_texture_trace,
+            g_crow_wing_callsite, g_crow_wing_texture_handle, g_crow_wing_texture_width,
+            g_crow_wing_texture_height,
             g_crow_wing_min_area, g_crow_wing_min_extent, g_crow_wing_max_extent,
             g_crow_wing_rhw_max, g_crow_wing_rhw_span_max, g_crow_wing_z_span_max,
             g_crow_wing_depth_floor_span, g_crow_wing_depth_max_span,

@@ -10,8 +10,13 @@ focused on model depth precision and polygon seam cleanup.
 - Upgrades requested z-buffer surfaces to 24/32-bit formats when possible.
 - Forces stable z-test/z-write state around accepted 3D model draw calls.
 - Runs the tuned invisible model depth prepass used by the current RE2 build.
+- Uses a less brittle color pass after the RE2 depth prepass and only treats
+  vertex alpha as transparent when alpha blending is actually enabled, which
+  helps custom opaque player models that carry non-255 lighting alpha.
 - Keeps UV coordinate correction for PS1-style model texture seams.
-- Keeps the targeted crow-wing depth exception from the current reference build.
+- Keeps the targeted crow-wing depth exception from the current reference build,
+  but requires a confirmed texture trace so modded model textures do not
+  accidentally match it by handle alone.
 
 ### Resident Evil 3 Classic Rebirth
 
