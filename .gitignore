@@ -1,0 +1,14 @@
+*.asi
+*.dll
+*.exp
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.log
+
+.vs/
+.vscode/
+baselines/
+re2_texture_dump/
+video_frames_current/
