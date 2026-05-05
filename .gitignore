@@ -6,6 +6,9 @@
 *.pdb
 *.ilk
 *.log
+*.csv
+*.dmp
+*.wer
 
 .vs/
 .vscode/
