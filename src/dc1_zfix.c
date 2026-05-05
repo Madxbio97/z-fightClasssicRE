@@ -28,6 +28,7 @@
 #define D3DSHADE_GOURAUD 2
 #define D3DSAMP_MAGFILTER 5
 #define D3DSAMP_MINFILTER 6
+#define D3DSAMP_MIPFILTER 7
 #define D3DTEXF_LINEAR 2
 #define D3DBACKBUFFER_TYPE_MONO 0
 #define D3DMULTISAMPLE_NONE 0
@@ -140,6 +141,7 @@ typedef struct D3D9StateSnapshot {
   DWORD dither_enable;
   DWORD sampler_mag;
   DWORD sampler_min;
+  DWORD sampler_mip;
   int has_z_enable;
   int has_z_write;
   int has_z_func;
@@ -149,6 +151,7 @@ typedef struct D3D9StateSnapshot {
   int has_dither_enable;
   int has_sampler_mag;
   int has_sampler_min;
+  int has_sampler_mip;
 } D3D9StateSnapshot;
 
 typedef struct HookEntry {
@@ -210,7 +213,7 @@ static const int g_force_z_write = 1;
 static const int g_force_z_func = D3DCMP_LESSEQUAL;
 static const int g_restore_state = 1;
 static const int g_clear_depth_each_scene = 1;
-static const int g_model_linear_filter = 0;
+static const int g_model_linear_filter = 1;
 static const int g_model_gouraud_shading = 1;
 static const int g_model_dither = 1;
 static const int g_model_uv_correction = 1;
@@ -227,6 +230,8 @@ static const int g_transparent_model_depth_adjust = 1;
 static const int g_transparent_model_z_write_soft_opaque = 0;
 static const int g_transparent_thin_stabilization = 1;
 static const int g_dc1_accept_flat_3d_geometry = 1;
+static const int g_dc1_half_pixel_correction = 1;
+static const int g_dc1_fine_vertex_snap = 0;
 static const LONG g_initial_frame_summaries = 3;
 static const LONG g_frame_summary_interval = 300;
 
@@ -246,9 +251,10 @@ static const float g_transparent_thin_depth_bias = -0.000007f;
 static const float g_model_uv_snap_grid = 255.0f;
 static const float g_model_uv_center_grid = 256.0f;
 static const float g_model_uv_snap_epsilon = 0.015f;
-static const float g_model_subpixel_grid = 4.0f;
-static const float g_model_subpixel_epsilon = 0.1260f;
-static const int g_dc1_anchor_stabilization = 1;
+static const float g_model_subpixel_grid = 16.0f;
+static const float g_model_subpixel_epsilon = 0.0315f;
+static const float g_dc1_half_pixel_offset = -0.5f;
+static const int g_dc1_anchor_stabilization = 0;
 static const float g_dc1_anchor_grid = 4.0f;
 static const float g_dc1_anchor_max_extent = 520.0f;
 static const float g_dc1_anchor_max_area = 180000.0f;
@@ -1307,25 +1313,43 @@ static DWORD ApplyDc1AnchorStabilization(D3D9TLVERTEX* vertices, DWORD vertex_co
   return vertex_count;
 }
 
+static DWORD ApplyDc1HalfPixelCorrection(D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!g_dc1_half_pixel_correction || !vertices || vertex_count == 0 ||
+      AbsF(g_dc1_half_pixel_offset) <= 0.0f)
+    return 0;
+
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    vertices[i].sx += g_dc1_half_pixel_offset;
+    vertices[i].sy += g_dc1_half_pixel_offset;
+  }
+  return vertex_count;
+}
+
 static DWORD ApplyModelSubpixelStabilization(D3D9TLVERTEX* vertices, DWORD vertex_count,
                                              const DrawBounds* bounds)
 {
   if (!g_model_subpixel_stabilization || !vertices || vertex_count == 0)
     return 0;
 
-  DWORD changed = ApplyDc1AnchorStabilization(vertices, vertex_count, bounds);
-  for (DWORD i = 0; i < vertex_count; i++)
+  DWORD changed = ApplyDc1HalfPixelCorrection(vertices, vertex_count);
+  changed += ApplyDc1AnchorStabilization(vertices, vertex_count, bounds);
+  if (g_dc1_fine_vertex_snap)
   {
-    const float old_x = vertices[i].sx;
-    const float old_y = vertices[i].sy;
-    const float new_x = SnapModelScreenCoord(old_x);
-    const float new_y = SnapModelScreenCoord(old_y);
-    vertices[i].sx = new_x;
-    vertices[i].sy = new_y;
-    if (new_x != old_x)
-      changed++;
-    if (new_y != old_y)
-      changed++;
+    for (DWORD i = 0; i < vertex_count; i++)
+    {
+      const float old_x = vertices[i].sx;
+      const float old_y = vertices[i].sy;
+      const float new_x = SnapModelScreenCoord(old_x);
+      const float new_y = SnapModelScreenCoord(old_y);
+      vertices[i].sx = new_x;
+      vertices[i].sy = new_y;
+      if (new_x != old_x)
+        changed++;
+      if (new_y != old_y)
+        changed++;
+    }
   }
 
   if (changed)
@@ -1439,6 +1463,7 @@ static void CaptureState(void* self, D3D9StateSnapshot* snapshot)
   snapshot->has_dither_enable = CaptureRenderState(self, D3DRS_DITHERENABLE, &snapshot->dither_enable);
   snapshot->has_sampler_mag = CaptureSamplerState(self, 0, D3DSAMP_MAGFILTER, &snapshot->sampler_mag);
   snapshot->has_sampler_min = CaptureSamplerState(self, 0, D3DSAMP_MINFILTER, &snapshot->sampler_min);
+  snapshot->has_sampler_mip = CaptureSamplerState(self, 0, D3DSAMP_MIPFILTER, &snapshot->sampler_mip);
 }
 
 static void ForceModelState(void* self, const D3D9StateSnapshot* snapshot)
@@ -1459,6 +1484,8 @@ static void ForceModelState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneSamplerState(self, 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
   if (g_model_linear_filter && snapshot->has_sampler_min)
     SetOneSamplerState(self, 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+  if (g_model_linear_filter && snapshot->has_sampler_mip)
+    SetOneSamplerState(self, 0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 }
 
 static void ForceTransparentModelState(void* self, const D3D9StateSnapshot* snapshot, int write_depth)
@@ -1477,6 +1504,8 @@ static void ForceTransparentModelState(void* self, const D3D9StateSnapshot* snap
     SetOneSamplerState(self, 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
   if (g_model_linear_filter && snapshot->has_sampler_min)
     SetOneSamplerState(self, 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+  if (g_model_linear_filter && snapshot->has_sampler_mip)
+    SetOneSamplerState(self, 0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 }
 
 static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
@@ -1501,6 +1530,8 @@ static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneSamplerState(self, 0, D3DSAMP_MAGFILTER, snapshot->sampler_mag);
   if (snapshot->has_sampler_min)
     SetOneSamplerState(self, 0, D3DSAMP_MINFILTER, snapshot->sampler_min);
+  if (snapshot->has_sampler_mip)
+    SetOneSamplerState(self, 0, D3DSAMP_MIPFILTER, snapshot->sampler_mip);
 }
 
 static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc orig, DWORD primitive_type,
@@ -1562,6 +1593,27 @@ static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrim
   RestoreState(self, &snapshot);
   if (copy)
     HeapFree(GetProcessHeap(), 0, copy);
+  return hr;
+}
+
+static HRESULT DrawPrimitiveUPWithDc1HalfPixelOnly(void* self, D3D9DrawPrimitiveUPProc orig,
+                                                   DWORD primitive_type, UINT primitive_count,
+                                                   const void* vertex_data, UINT vertex_stride,
+                                                   DWORD vertex_count)
+{
+  if (!g_dc1_half_pixel_correction || !vertex_data || vertex_count == 0 ||
+      vertex_count > 4096 || vertex_stride != sizeof(D3D9TLVERTEX))
+    return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
+
+  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)vertex_count;
+  D3D9TLVERTEX* copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+  if (!copy)
+    return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
+
+  memcpy(copy, vertex_data, bytes);
+  ApplyDc1HalfPixelCorrection(copy, vertex_count);
+  HRESULT hr = orig(self, primitive_type, primitive_count, copy, vertex_stride);
+  HeapFree(GetProcessHeap(), 0, copy);
   return hr;
 }
 
@@ -1690,7 +1742,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
       InterlockedIncrement(&g_dpup_rhw_rejected);
     else
       InterlockedIncrement(&g_dpup_other_rejected);
-    return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
+    return DrawPrimitiveUPWithDc1HalfPixelOnly(self, orig, primitive_type, primitive_count,
+                                               vertex_data, vertex_stride, vertex_count);
   }
 
   InterlockedIncrement(&g_dpup_accepted);
@@ -2025,10 +2078,12 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
     LogLine("dc1_zfix loaded");
-    LogLine("geometry-stabilizer subpixel=%d grid=%.1f eps=%.4f depthBias=%d opaque=%.7f "
+    LogLine("geometry-stabilizer subpixel=%d halfPixel=%d/%.2f linearFilter=%d "
+            "fineSnap=%d grid=%.1f eps=%.4f depthBias=%d opaque=%.7f "
             "transparent=%.7f thinTransparent=%.7f thinExpand=%.3f anchor=%d/%.1f",
-            g_model_subpixel_stabilization, g_model_subpixel_grid,
-            g_model_subpixel_epsilon, g_model_depth_bias_enabled,
+            g_model_subpixel_stabilization, g_dc1_half_pixel_correction,
+            g_dc1_half_pixel_offset, g_model_linear_filter, g_dc1_fine_vertex_snap,
+            g_model_subpixel_grid, g_model_subpixel_epsilon, g_model_depth_bias_enabled,
             g_model_depth_bias, g_transparent_model_depth_bias,
             g_transparent_thin_depth_bias, g_transparent_thin_expand_pixels,
             g_dc1_anchor_stabilization, g_dc1_anchor_grid);

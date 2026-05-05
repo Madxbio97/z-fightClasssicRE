@@ -42,9 +42,10 @@ plus Dino Crisis 1, focused on model depth precision and polygon stability.
 - Treats the game as a polygonal 3D scene instead of a prerender-background
   game: the screen/rhw limits are wider so level geometry can enter the stable
   geometry path.
-- Adds quarter-pixel vertex stabilization and a wider center-anchor snap for
-  distant or mid-size polygons, reducing camera-turn geometry shimmer while
-  avoiding flat UI overlays.
+- Uses linear texture filtering and a D3D9 half-pixel correction for TL
+  geometry to reduce distant texture shimmer during camera turns.
+- Avoids independent per-vertex snapping in the DC1 build, because snapping
+  split triangle vertices can expose thin wireframe-like seams on models.
 
 ## Build
 
