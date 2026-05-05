@@ -42,10 +42,10 @@ plus Dino Crisis 1, focused on model depth precision and polygon stability.
 - Treats the game as a polygonal 3D scene instead of a prerender-background
   game: the screen/rhw limits are wider so level geometry can enter the stable
   geometry path.
+- Restores the high-precision/owned depth buffer path, per-scene depth clear,
+  and stable z-test/z-write state around accepted 3D draw calls.
 - Leaves the incoming TL vertices as 32-bit float pass-through data: no
   per-vertex snap, half-pixel offset, UV snap, or depth bias is applied.
-- Does not upgrade, replace, clear, or bias the depth buffer in the DC1 build;
-  it only forces linear texture filtering around accepted 3D draw calls.
 
 ## Build
 
