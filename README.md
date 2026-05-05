@@ -42,10 +42,10 @@ plus Dino Crisis 1, focused on model depth precision and polygon stability.
 - Treats the game as a polygonal 3D scene instead of a prerender-background
   game: the screen/rhw limits are wider so level geometry can enter the stable
   geometry path.
-- Uses linear texture filtering and a D3D9 half-pixel correction for TL
-  geometry to reduce distant texture shimmer during camera turns.
-- Avoids independent per-vertex snapping in the DC1 build, because snapping
-  split triangle vertices can expose thin wireframe-like seams on models.
+- Leaves the incoming TL vertices as 32-bit float pass-through data: no
+  per-vertex snap, half-pixel offset, UV snap, or depth bias is applied.
+- Does not upgrade, replace, clear, or bias the depth buffer in the DC1 build;
+  it only forces linear texture filtering around accepted 3D draw calls.
 
 ## Build
 

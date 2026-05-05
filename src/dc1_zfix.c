@@ -205,32 +205,32 @@ static volatile LONG g_set_fvf_calls = 0;
 static volatile LONG g_set_render_state_calls = 0;
 
 static const int g_enabled = 1;
-static const int g_upgrade_depth_stencil = 1;
-static const int g_prefer_high_precision_depth = 1;
-static const int g_force_owned_depth_surface = 1;
-static const int g_force_z_enable = 1;
-static const int g_force_z_write = 1;
+static const int g_upgrade_depth_stencil = 0;
+static const int g_prefer_high_precision_depth = 0;
+static const int g_force_owned_depth_surface = 0;
+static const int g_force_z_enable = 0;
+static const int g_force_z_write = 0;
 static const int g_force_z_func = D3DCMP_LESSEQUAL;
 static const int g_restore_state = 1;
-static const int g_clear_depth_each_scene = 1;
+static const int g_clear_depth_each_scene = 0;
 static const int g_model_linear_filter = 1;
-static const int g_model_gouraud_shading = 1;
-static const int g_model_dither = 1;
-static const int g_model_uv_correction = 1;
-static const int g_model_subpixel_stabilization = 1;
+static const int g_model_gouraud_shading = 0;
+static const int g_model_dither = 0;
+static const int g_model_uv_correction = 0;
+static const int g_model_subpixel_stabilization = 0;
 static const int g_model_screen_expand = 0;
 static const int g_skip_axis_tile_draws = 1;
 static const int g_min_vertex_alpha = 250;
 static const int g_reject_alpha_only_when_blending = 1;
 static const int g_diagnostics = 1;
 static const int g_opaque_model_disable_alpha_blend = 0;
-static const int g_model_depth_bias_enabled = 1;
-static const int g_transparent_model_z_test = 1;
-static const int g_transparent_model_depth_adjust = 1;
+static const int g_model_depth_bias_enabled = 0;
+static const int g_transparent_model_z_test = 0;
+static const int g_transparent_model_depth_adjust = 0;
 static const int g_transparent_model_z_write_soft_opaque = 0;
-static const int g_transparent_thin_stabilization = 1;
+static const int g_transparent_thin_stabilization = 0;
 static const int g_dc1_accept_flat_3d_geometry = 1;
-static const int g_dc1_half_pixel_correction = 1;
+static const int g_dc1_half_pixel_correction = 0;
 static const int g_dc1_fine_vertex_snap = 0;
 static const LONG g_initial_frame_summaries = 3;
 static const LONG g_frame_summary_interval = 300;
@@ -1472,7 +1472,7 @@ static void ForceModelState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneRenderState(self, D3DRS_ZENABLE, 1);
   if (g_force_z_write && snapshot->has_z_write)
     SetOneRenderState(self, D3DRS_ZWRITEENABLE, 1);
-  if (snapshot->has_z_func)
+  if (g_force_z_enable && snapshot->has_z_func)
     SetOneRenderState(self, D3DRS_ZFUNC, (DWORD)g_force_z_func);
   if (g_opaque_model_disable_alpha_blend && snapshot->has_alpha_blend)
     SetOneRenderState(self, D3DRS_ALPHABLENDENABLE, 0);
@@ -1492,9 +1492,9 @@ static void ForceTransparentModelState(void* self, const D3D9StateSnapshot* snap
 {
   if (g_force_z_enable && snapshot->has_z_enable)
     SetOneRenderState(self, D3DRS_ZENABLE, 1);
-  if (snapshot->has_z_write)
+  if (g_force_z_write && snapshot->has_z_write)
     SetOneRenderState(self, D3DRS_ZWRITEENABLE, write_depth ? 1 : 0);
-  if (snapshot->has_z_func)
+  if (g_force_z_enable && snapshot->has_z_func)
     SetOneRenderState(self, D3DRS_ZFUNC, (DWORD)g_force_z_func);
   if (g_model_gouraud_shading && snapshot->has_shade_mode)
     SetOneRenderState(self, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
@@ -2078,12 +2078,19 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
     LogLine("dc1_zfix loaded");
-    LogLine("geometry-stabilizer subpixel=%d halfPixel=%d/%.2f linearFilter=%d "
+    LogLine("vertex-pass-through depthTouch=%d ownedDepth=%d clearDepth=%d "
+            "subpixel=%d halfPixel=%d/%.2f uvCorrection=%d linearFilter=%d "
             "fineSnap=%d grid=%.1f eps=%.4f depthBias=%d opaque=%.7f "
             "transparent=%.7f thinTransparent=%.7f thinExpand=%.3f anchor=%d/%.1f",
+            g_upgrade_depth_stencil || g_force_owned_depth_surface ||
+            g_clear_depth_each_scene || g_force_z_enable || g_force_z_write ||
+            g_model_depth_bias_enabled || g_transparent_model_z_test ||
+            g_transparent_model_depth_adjust,
+            g_force_owned_depth_surface, g_clear_depth_each_scene,
             g_model_subpixel_stabilization, g_dc1_half_pixel_correction,
-            g_dc1_half_pixel_offset, g_model_linear_filter, g_dc1_fine_vertex_snap,
-            g_model_subpixel_grid, g_model_subpixel_epsilon, g_model_depth_bias_enabled,
+            g_dc1_half_pixel_offset, g_model_uv_correction, g_model_linear_filter,
+            g_dc1_fine_vertex_snap, g_model_subpixel_grid, g_model_subpixel_epsilon,
+            g_model_depth_bias_enabled,
             g_model_depth_bias, g_transparent_model_depth_bias,
             g_transparent_thin_depth_bias, g_transparent_thin_expand_pixels,
             g_dc1_anchor_stabilization, g_dc1_anchor_grid);
