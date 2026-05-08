@@ -306,9 +306,12 @@ static DWORD g_high_poly_scene_draws = 0;
 static DWORD g_high_poly_scene_vertices = 0;
 static DWORD g_high_poly_scene_max_draw_tris = 0;
 static DWORD g_high_poly_scene_max_draw_vertices = 0;
+static uintptr_t g_high_poly_scene_min_entry_ptr = 0;
+static uintptr_t g_high_poly_scene_max_entry_ptr = 0;
 static DWORD g_high_poly_max_scene_tris = 0;
 static DWORD g_high_poly_max_draw_tris = 0;
 static DWORD g_high_poly_max_draw_vertices = 0;
+static DWORD g_high_poly_max_entry_span = 0;
 static DWORD g_high_poly_burst_caller = 0;
 static DWORD g_high_poly_burst_tris = 0;
 static DWORD g_high_poly_burst_draws = 0;
@@ -440,10 +443,12 @@ static const float g_adaptive_depth_small_min_extent = 3.0f;
 static const float g_adaptive_depth_small_strength = 0.55f;
 static const float g_adaptive_depth_rhw_signal = 0.00000001f;
 static const float g_adaptive_depth_axis_signal = 1.0f;
-static const DWORD g_high_poly_nominal_limit = 2700u;
-static const DWORD g_high_poly_near_limit_margin = 96u;
+static const DWORD g_high_poly_reference_tris = 0u;
+static const DWORD g_high_poly_scene_log_threshold = 2048u;
+static const DWORD g_high_poly_burst_log_threshold = 512u;
+static const DWORD g_high_poly_entry_stride = 136u;
 static const DWORD g_high_poly_draw_log_tri_threshold = 1024u;
-static const DWORD g_high_poly_constant_scan_limit = 64u;
+static const DWORD g_high_poly_constant_scan_limit = 128u;
 static const DWORD g_model_callsite_min = 0x0040E000u;
 static const DWORD g_model_callsite_max = 0x0040F800u;
 static const DWORD g_re2_batched_model_callsite = 0x004080D8u;
@@ -832,12 +837,12 @@ static void LogDrawCallsiteSummary(const char* reason)
           g_experimental_subpixel_draws, g_experimental_subpixel_vertices,
           g_experimental_contact_shadow_draws, g_experimental_contact_shadow_vertices,
           g_experimental_cutout_alpha_draws, g_experimental_cutout_alpha_vertices);
-  LogLine("summary highpoly diagnostics=%d nominalLimit=%lu maxSceneTris=%lu "
-          "maxDrawTris=%lu maxDrawVerts=%lu burstLogged=%ld constantsLogged=%ld",
-          g_high_poly_diagnostics, g_high_poly_nominal_limit,
-          g_high_poly_max_scene_tris, g_high_poly_max_draw_tris,
-          g_high_poly_max_draw_vertices, g_high_poly_burst_logged,
-          g_high_poly_constant_logged);
+  LogLine("summary highpoly diagnostics=%d referenceTris=%lu maxSceneTris=%lu "
+          "maxEntrySpan=%lu maxDrawTris=%lu maxDrawVerts=%lu burstLogged=%ld constantsLogged=%ld",
+          g_high_poly_diagnostics, g_high_poly_reference_tris,
+          g_high_poly_max_scene_tris, g_high_poly_max_entry_span,
+          g_high_poly_max_draw_tris, g_high_poly_max_draw_vertices,
+          g_high_poly_burst_logged, g_high_poly_constant_logged);
   LogLine("summary texture_trace enabled=%d surfaces=%ld surfaceSlots=%ld surfaceLogged=%ld "
           "textureQI=%ld bindings=%ld bindingLogged=%ld handleCalls=%ld handles=%ld handleLogged=%ld",
           g_texture_handle_trace, g_texture_surface_seen, g_texture_surface_count,
@@ -863,11 +868,8 @@ static void HighPolyFlushBurst(const char* reason)
   if (!g_high_poly_diagnostics || !g_high_poly_burst_caller || g_high_poly_burst_tris == 0)
     return;
 
-  const DWORD near_limit =
-    g_high_poly_nominal_limit > g_high_poly_near_limit_margin ?
-    (g_high_poly_nominal_limit - g_high_poly_near_limit_margin) : 0u;
   const int interesting =
-    g_high_poly_burst_tris >= near_limit ||
+    g_high_poly_burst_tris >= g_high_poly_burst_log_threshold ||
     g_high_poly_burst_tris > g_high_poly_max_scene_tris ||
     g_high_poly_burst_tris > g_high_poly_max_draw_tris;
 
@@ -879,11 +881,11 @@ static void HighPolyFlushBurst(const char* reason)
       ModuleAddressInfo info;
       ResolveModuleForAddress(g_high_poly_burst_caller, &info);
       LogLine("highpoly-burst #%ld reason=%s caller=%s+0x%08lX raw=0x%08lX "
-              "draws=%lu tris=%lu vertices=%lu nominalLimit=%lu near=%lu",
+              "draws=%lu tris=%lu vertices=%lu threshold=%lu",
               logged, reason ? reason : "flush", info.module_name, info.module_offset,
               g_high_poly_burst_caller, g_high_poly_burst_draws,
               g_high_poly_burst_tris, g_high_poly_burst_vertices,
-              g_high_poly_nominal_limit, near_limit);
+              g_high_poly_burst_log_threshold);
     }
   }
 
@@ -895,7 +897,8 @@ static void HighPolyFlushBurst(const char* reason)
 
 static void TrackHighPolyDraw(DWORD caller, int accepted, int indexed, DWORD primitive_type,
                               DWORD vertex_count, DWORD index_count, DWORD tris,
-                              const DrawBounds* bounds, const char* reason)
+                              const void* vertices_ptr, const DrawBounds* bounds,
+                              const char* reason)
 {
   if (!g_high_poly_diagnostics || tris == 0)
     return;
@@ -919,6 +922,14 @@ static void TrackHighPolyDraw(DWORD caller, int accepted, int indexed, DWORD pri
   g_high_poly_scene_tris += tris;
   g_high_poly_scene_draws++;
   g_high_poly_scene_vertices += effective_vertices;
+  if (!indexed && vertices_ptr)
+  {
+    const uintptr_t ptr = (uintptr_t)vertices_ptr;
+    if (!g_high_poly_scene_min_entry_ptr || ptr < g_high_poly_scene_min_entry_ptr)
+      g_high_poly_scene_min_entry_ptr = ptr;
+    if (ptr > g_high_poly_scene_max_entry_ptr)
+      g_high_poly_scene_max_entry_ptr = ptr;
+  }
 
   if (g_high_poly_burst_caller && g_high_poly_burst_caller != caller)
     HighPolyFlushBurst("caller-change");
@@ -956,6 +967,8 @@ static void ResetHighPolySceneCounters(void)
   g_high_poly_scene_vertices = 0;
   g_high_poly_scene_max_draw_tris = 0;
   g_high_poly_scene_max_draw_vertices = 0;
+  g_high_poly_scene_min_entry_ptr = 0;
+  g_high_poly_scene_max_entry_ptr = 0;
 }
 
 static void LogHighPolySceneSummary(LONG scene)
@@ -966,18 +979,29 @@ static void LogHighPolySceneSummary(LONG scene)
   if (g_high_poly_scene_tris > g_high_poly_max_scene_tris)
     g_high_poly_max_scene_tris = g_high_poly_scene_tris;
 
-  const DWORD near_limit =
-    g_high_poly_nominal_limit > g_high_poly_near_limit_margin ?
-    (g_high_poly_nominal_limit - g_high_poly_near_limit_margin) : 0u;
-  if (scene <= 8 || g_high_poly_scene_tris >= near_limit ||
+  DWORD entry_span = 0;
+  if (g_high_poly_scene_min_entry_ptr && g_high_poly_scene_max_entry_ptr >= g_high_poly_scene_min_entry_ptr)
+  {
+    const uintptr_t byte_span = g_high_poly_scene_max_entry_ptr - g_high_poly_scene_min_entry_ptr;
+    entry_span = (DWORD)(byte_span / g_high_poly_entry_stride) + 1u;
+    if (entry_span > g_high_poly_max_entry_span)
+      g_high_poly_max_entry_span = entry_span;
+  }
+
+  if (scene <= 8 || g_high_poly_scene_tris >= g_high_poly_scene_log_threshold ||
+      entry_span >= g_high_poly_scene_log_threshold ||
       (scene % 120) == 0)
   {
     LogLine("highpoly-scene scene=%ld draws=%lu tris=%lu vertices=%lu "
-            "maxDrawTris=%lu maxDrawVerts=%lu maxSceneTris=%lu nominalLimit=%lu near=%lu",
+            "entrySpan=%lu entryPtr=0x%p..0x%p stride=%lu "
+            "maxDrawTris=%lu maxDrawVerts=%lu maxSceneTris=%lu maxEntrySpan=%lu threshold=%lu",
             scene, g_high_poly_scene_draws, g_high_poly_scene_tris,
-            g_high_poly_scene_vertices, g_high_poly_scene_max_draw_tris,
+            g_high_poly_scene_vertices, entry_span,
+            (void*)g_high_poly_scene_min_entry_ptr,
+            (void*)g_high_poly_scene_max_entry_ptr,
+            g_high_poly_entry_stride, g_high_poly_scene_max_draw_tris,
             g_high_poly_scene_max_draw_vertices, g_high_poly_max_scene_tris,
-            g_high_poly_nominal_limit, near_limit);
+            g_high_poly_max_entry_span, g_high_poly_scene_log_threshold);
   }
 }
 
@@ -3889,7 +3913,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
       TrackHighPolyDraw(caller, 1, 0, primitive_type, vertex_count, 0, tris,
-                        &transparent_bounds,
+                        vertices, &transparent_bounds,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent");
       return DrawPrimitiveWithTransparentModelDepth(self, orig, primitive_type, vertex_type, vertices,
                                                    vertex_count, flags, caller, &transparent_bounds,
@@ -3900,7 +3924,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
     TrackDrawCallsite(caller, "reject", 0, 0, primitive_type, vertex_count, 0, tris,
                       reason, &bounds);
     TrackHighPolyDraw(caller, 0, 0, primitive_type, vertex_count, 0, tris,
-                      &bounds, reason);
+                      vertices, &bounds, reason);
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, NULL, 0);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
   }
@@ -3909,7 +3933,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   TrackDrawCallsite(caller, "accept", 0, 0, primitive_type, vertex_count, 0, tris,
                     "ok", &bounds);
   TrackHighPolyDraw(caller, 1, 0, primitive_type, vertex_count, 0, tris,
-                    &bounds, "accepted");
+                    vertices, &bounds, "accepted");
   return DrawPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count, flags,
                                      caller, tris, &bounds);
 }
@@ -3965,7 +3989,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
       TrackHighPolyDraw(caller, 1, 1, primitive_type, vertex_count, index_count, tris,
-                        &transparent_bounds,
+                        vertices, &transparent_bounds,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent");
       return DrawIndexedPrimitiveWithTransparentModelDepth(self, orig, primitive_type, vertex_type, vertices,
                                                           vertex_count, indices, index_count, flags,
@@ -3994,7 +4018,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
                         reason ? reason : "bad_indices", &bounds);
     }
     TrackHighPolyDraw(caller, 0, 1, primitive_type, vertex_count, index_count, tris,
-                      &bounds, bounds_ok ? reason : (reason ? reason : "bad_indices"));
+                      vertices, &bounds, bounds_ok ? reason : (reason ? reason : "bad_indices"));
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, indices, index_count);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
   }
@@ -4003,7 +4027,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   TrackDrawCallsite(caller, "accept", 1, 0, primitive_type, vertex_count, index_count, tris,
                     "ok", &bounds);
   TrackHighPolyDraw(caller, 1, 1, primitive_type, vertex_count, index_count, tris,
-                    &bounds, "accepted");
+                    vertices, &bounds, "accepted");
   return DrawIndexedPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count,
                                             indices, index_count, flags, caller, &bounds);
 }
@@ -4184,9 +4208,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_experimental_alpha_cutout_deluxe, g_experimental_room_target_luma,
             g_experimental_room_relight_max, g_experimental_half_pixel_strength,
             g_experimental_contact_shadow_max_luma, g_experimental_contact_shadow_output_alpha);
-    LogLine("highpoly diagnostics=%d nominalLimit=%lu nearMargin=%lu drawLogTris=%lu scanConstants=%d",
-            g_high_poly_diagnostics, g_high_poly_nominal_limit,
-            g_high_poly_near_limit_margin, g_high_poly_draw_log_tri_threshold,
+    LogLine("highpoly diagnostics=%d referenceTris=%lu sceneThreshold=%lu burstThreshold=%lu "
+            "entryStride=%lu drawLogTris=%lu scanConstants=%d",
+            g_high_poly_diagnostics, g_high_poly_reference_tris,
+            g_high_poly_scene_log_threshold, g_high_poly_burst_log_threshold,
+            g_high_poly_entry_stride, g_high_poly_draw_log_tri_threshold,
             g_high_poly_scan_exe_constants);
     ScanHighPolyConstantsInExecutable();
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
