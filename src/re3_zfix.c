@@ -145,6 +145,8 @@ static DWORD g_current_fvf = 0;
 static void* g_current_texture0 = NULL;
 static UINT g_current_texture0_width = 0;
 static UINT g_current_texture0_height = 0;
+static float g_experimental_room_luma = 118.0f;
+static float g_experimental_room_boost = 0.0f;
 static void* g_owned_depth_device = NULL;
 static void* g_owned_depth_surface = NULL;
 static UINT g_owned_depth_width = 0;
@@ -171,6 +173,9 @@ static volatile LONG g_model_lighting_draws = 0;
 static volatile LONG g_model_lighting_vertices = 0;
 static volatile LONG g_model_geometry_stabilized_draws = 0;
 static volatile LONG g_model_geometry_stabilized_vertices = 0;
+static volatile LONG g_experimental_room_relight_draws = 0;
+static volatile LONG g_experimental_half_pixel_draws = 0;
+static volatile LONG g_experimental_half_pixel_vertices = 0;
 static volatile LONG g_callsite_profile_hits = 0;
 static volatile LONG g_adaptive_depth_draws = 0;
 static volatile LONG g_adaptive_depth_vertices = 0;
@@ -212,6 +217,9 @@ static const int g_diagnostics = 1;
 static const int g_model_lighting = 1;
 static const int g_model_lighting_translucent = 0;
 static const int g_model_geometry_stabilization = 1;
+static const int g_experimental_model_polish = 1;
+static const int g_experimental_room_relighting = 1;
+static const int g_experimental_half_pixel_stabilizer = 1;
 static const int g_callsite_profiles_enabled = 1;
 static const int g_adaptive_depth_conflict_resolver = 1;
 static const int g_bad_draw_autologger = 1;
@@ -250,6 +258,13 @@ static const float g_model_geometry_snap_rhw_grid = 1048576.0f;
 static const float g_model_geometry_min_area = 4.0f;
 static const float g_model_geometry_max_area = 250000.0f;
 static const float g_model_geometry_max_extent = 900.0f;
+static const float g_experimental_room_target_luma = 112.0f;
+static const float g_experimental_room_relight_max = 0.070f;
+static const float g_experimental_room_relight_warmth = 0.018f;
+static const float g_experimental_directional_screen = 0.018f;
+static const float g_experimental_half_pixel_strength = 0.32f;
+static const float g_experimental_half_pixel_max_delta = 0.34f;
+static const float g_experimental_half_pixel_max_area = 160000.0f;
 static const float g_adaptive_depth_flat_span = 0.000080f;
 static const float g_adaptive_depth_target_span = 0.000420f;
 static const float g_adaptive_depth_max_span = 0.000900f;
@@ -1321,6 +1336,47 @@ static DWORD ApplyModelGeometryStabilization(D3D9TLVERTEX* vertices, DWORD verte
   return changed_vertices;
 }
 
+static DWORD ApplyExperimentalHalfPixelStabilizer(D3D9TLVERTEX* vertices, DWORD vertex_count,
+                                                  const DrawBounds* bounds)
+{
+  if (!g_experimental_model_polish || !g_experimental_half_pixel_stabilizer ||
+      !vertices || vertex_count == 0 || !bounds)
+    return 0;
+  if (bounds->area <= 0.0f || bounds->area > g_experimental_half_pixel_max_area ||
+      bounds->min_z < 0.0f || bounds->max_z > 1.0f)
+    return 0;
+
+  DWORD changed = 0;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    D3D9TLVERTEX* v = &vertices[i];
+    const float snap_x = HalfPixelCenter(v->sx);
+    const float snap_y = HalfPixelCenter(v->sy);
+    const float dx = snap_x - v->sx;
+    const float dy = snap_y - v->sy;
+    int touched = 0;
+    if (AbsF(dx) <= g_experimental_half_pixel_max_delta && AbsF(dx) > 0.0001f)
+    {
+      v->sx += dx * g_experimental_half_pixel_strength;
+      touched = 1;
+    }
+    if (AbsF(dy) <= g_experimental_half_pixel_max_delta && AbsF(dy) > 0.0001f)
+    {
+      v->sy += dy * g_experimental_half_pixel_strength;
+      touched = 1;
+    }
+    if (touched)
+      changed++;
+  }
+
+  if (changed)
+  {
+    InterlockedIncrement(&g_experimental_half_pixel_draws);
+    InterlockedExchangeAdd(&g_experimental_half_pixel_vertices, (LONG)changed);
+  }
+  return changed;
+}
+
 static float ModelLightingDepth(const D3D9TLVERTEX* v)
 {
   return v ? (v->sz + (v->rhw * g_model_lighting_rhw_scale)) : 0.0f;
@@ -1446,11 +1502,72 @@ static void AccumulatePrimitiveLighting(float* light, DWORD* counts, DWORD verte
   }
 }
 
+static float VertexColorLuma(uint32_t color)
+{
+  const float r = (float)((color >> 16) & 0xFFu);
+  const float g = (float)((color >> 8) & 0xFFu);
+  const float b = (float)(color & 0xFFu);
+  return (r * 0.299f) + (g * 0.587f) + (b * 0.114f);
+}
+
+static float AverageVertexLuma(const D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!vertices || vertex_count == 0)
+    return g_experimental_room_target_luma;
+
+  float total = 0.0f;
+  for (DWORD i = 0; i < vertex_count; i++)
+    total += VertexColorLuma(vertices[i].color);
+  return total / (float)vertex_count;
+}
+
+static void UpdateExperimentalRoomRelight(const D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!g_experimental_model_polish || !g_experimental_room_relighting ||
+      !vertices || vertex_count == 0)
+    return;
+
+  const float batch_luma = AverageVertexLuma(vertices, vertex_count);
+  g_experimental_room_luma = (g_experimental_room_luma * 0.94f) + (batch_luma * 0.06f);
+  const float darkness =
+    Clamp01((g_experimental_room_target_luma - g_experimental_room_luma) /
+            g_experimental_room_target_luma);
+  g_experimental_room_boost = darkness * g_experimental_room_relight_max;
+  InterlockedIncrement(&g_experimental_room_relight_draws);
+}
+
+static float ExperimentalScreenKeyLight(const D3D9TLVERTEX* vertices, DWORD vertex_count,
+                                        DWORD index, const DrawBounds* bounds)
+{
+  if (!g_experimental_model_polish || !vertices || vertex_count == 0 ||
+      index >= vertex_count || !bounds)
+    return 0.0f;
+
+  const float width = AbsF(bounds->width);
+  const float height = AbsF(bounds->height);
+  if (width < 1.0f || height < 1.0f)
+    return 0.0f;
+
+  const D3D9TLVERTEX* v = &vertices[index];
+  const float x = Clamp01((v->sx - bounds->min_x) / width);
+  const float y = Clamp01((v->sy - bounds->min_y) / height);
+  const float from_upper_left = Clamp01(((1.0f - y) * 0.68f) + ((1.0f - x) * 0.32f));
+  return from_upper_left * g_experimental_directional_screen;
+}
+
 static DWORD RelightVertexColors(D3D9TLVERTEX* vertices, DWORD vertex_count,
                                  const float* light, const DWORD* counts)
 {
   if (!vertices || vertex_count == 0)
     return 0;
+
+  DrawBounds lighting_bounds;
+  DrawBounds* lighting_bounds_ptr = NULL;
+  if (g_experimental_model_polish)
+  {
+    ComputeDrawBounds(vertices, vertex_count, &lighting_bounds);
+    lighting_bounds_ptr = &lighting_bounds;
+  }
 
   DWORD changed = 0;
   for (DWORD i = 0; i < vertex_count; i++)
@@ -1470,6 +1587,7 @@ static DWORD RelightVertexColors(D3D9TLVERTEX* vertices, DWORD vertex_count,
     float vertex_light = 0.0f;
     if (light && counts && counts[i] > 0)
       vertex_light = (light[i] / (float)counts[i]) * light_weight;
+    vertex_light += ExperimentalScreenKeyLight(vertices, vertex_count, i, lighting_bounds_ptr);
 
     if (r < g_model_lighting_ambient_floor)
       r += (g_model_lighting_ambient_floor - r) * 0.55f;
@@ -1486,6 +1604,14 @@ static DWORD RelightVertexColors(D3D9TLVERTEX* vertices, DWORD vertex_count,
     r = luma + ((r - luma) * g_model_lighting_saturation);
     g = luma + ((g - luma) * g_model_lighting_saturation);
     b = luma + ((b - luma) * g_model_lighting_saturation);
+
+    if (g_experimental_model_polish && g_experimental_room_relighting)
+    {
+      const float room_boost = g_experimental_room_boost * shadow_weight;
+      r += (255.0f - r) * room_boost * (1.0f + g_experimental_room_relight_warmth);
+      g += (255.0f - g) * room_boost;
+      b += (255.0f - b) * room_boost * (1.0f - g_experimental_room_relight_warmth);
+    }
 
     r = (r * gain) + (vertex_light * 210.0f);
     g = (g * gain) + (vertex_light * 202.0f);
@@ -1523,6 +1649,8 @@ static DWORD ApplyModelLighting(D3D9TLVERTEX* vertices, DWORD vertex_count, DWOR
     return 0;
   if (translucent && !g_model_lighting_translucent)
     return 0;
+
+  UpdateExperimentalRoomRelight(vertices, vertex_count);
 
   float* light = (float*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                    sizeof(float) * (SIZE_T)vertex_count);
@@ -1737,9 +1865,13 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   const DWORD geometry_changed = ApplyModelGeometryStabilization(copy, vertex_count, &adjusted_bounds);
   if (geometry_changed)
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
+  const DWORD half_pixel_changed =
+    ApplyExperimentalHalfPixelStabilizer(copy, vertex_count, &adjusted_bounds);
+  if (half_pixel_changed)
+    ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   LogBadDrawCandidate(caller, "opaque-dpup", 0, primitive_type, vertex_count, 0,
                       profile, &before_bounds, &adjusted_bounds,
-                      adaptive_changed + geometry_changed);
+                      adaptive_changed + geometry_changed + half_pixel_changed);
   ApplyModelLighting(copy, vertex_count, primitive_type, NULL, 0, 0, 0);
 
   if (g_model_depth_prepass)
@@ -1801,10 +1933,14 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
   const DWORD geometry_changed = ApplyModelGeometryStabilization(copy, num_vertices, &adjusted_bounds);
   if (geometry_changed)
     ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
+  const DWORD half_pixel_changed =
+    ApplyExperimentalHalfPixelStabilizer(copy, num_vertices, &adjusted_bounds);
+  if (half_pixel_changed)
+    ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
   LogBadDrawCandidate(caller, "opaque-dipup", 1, primitive_type, num_vertices,
                       VertexCountForPrimitive(primitive_type, primitive_count),
                       profile, &before_bounds, &adjusted_bounds,
-                      adaptive_changed + geometry_changed);
+                      adaptive_changed + geometry_changed + half_pixel_changed);
   ApplyModelLighting(copy, num_vertices, primitive_type, index_data, index_format,
                      VertexCountForPrimitive(primitive_type, primitive_count), 0);
 
@@ -2073,6 +2209,10 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
             g_set_render_state_calls, g_current_texture0,
             g_current_texture0_width, g_current_texture0_height, g_current_fvf,
             g_owned_depth_creates, g_owned_depth_sets, g_owned_depth_failures);
+    LogLine("experimental polish=%d room=%ld boost=%.4f luma=%.1f halfPixel=%ld/%ld",
+            g_experimental_model_polish, g_experimental_room_relight_draws,
+            g_experimental_room_boost, g_experimental_room_luma,
+            g_experimental_half_pixel_draws, g_experimental_half_pixel_vertices);
   }
   g_scene_open = 0;
   D3D9EndSceneProc orig = (D3D9EndSceneProc)GetOriginal(*(void***)self, 42);
@@ -2244,6 +2384,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_model_lighting_direct, g_model_lighting_rim,
             g_model_lighting_shadow_luma, g_model_lighting_light_luma,
             g_model_lighting_max_luma_boost);
+    LogLine("experimental polish=%d room=%d halfPixel=%d roomTarget=%.1f roomMax=%.3f halfStrength=%.2f",
+            g_experimental_model_polish, g_experimental_room_relighting,
+            g_experimental_half_pixel_stabilizer, g_experimental_room_target_luma,
+            g_experimental_room_relight_max, g_experimental_half_pixel_strength);
     PatchAllImports();
   }
   return TRUE;

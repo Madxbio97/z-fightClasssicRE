@@ -59,6 +59,17 @@ static inline float LerpF(float a, float b, float t)
   return a + ((b - a) * t);
 }
 
+static inline float FloorF(float v)
+{
+  const int i = (int)v;
+  return (v < (float)i) ? (float)(i - 1) : (float)i;
+}
+
+static inline float HalfPixelCenter(float v)
+{
+  return FloorF(v) + 0.5f;
+}
+
 static inline int NearF(float a, float b, float eps)
 {
   return AbsF(a - b) <= eps;

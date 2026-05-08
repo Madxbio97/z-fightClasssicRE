@@ -86,8 +86,95 @@ Outputs:
 - `re3_zfix.asi`
 - `dc1_zfix.asi`
 
-Copy the matching ASI next to the game executable and load it through the
-existing ASI loader.
+## Usage
+
+These fixes are distributed as separate ASI plugins. Use only the plugin that
+matches the game you are running:
+
+- Resident Evil 1: `re1_zfix.asi`
+- Resident Evil 2: `re2_zfix.asi`
+- Resident Evil 3: `re3_zfix.asi`
+
+### Installation
+
+1. Build the required plugin, or use a prebuilt ASI from a release package.
+2. Open the game installation folder.
+3. Copy the matching `.asi` file into the same folder as the game executable.
+4. Make sure the game already has an ASI loader installed. Classic Rebirth and
+   most RE-ENHANCE packages usually include one; otherwise install a compatible
+   ASI loader for the game first.
+5. Start the game normally.
+
+Do not install all three plugins into one game folder. Each game should only
+load its own matching ASI.
+
+### Per-Game Notes
+
+For Resident Evil 1, install `re1_zfix.asi`. The plugin is tuned for the older
+DirectDraw/Direct3D path and also handles the legacy Direct3D 1 execute-buffer
+path used by some builds. It writes `re1_zfix.log` next to the executable.
+
+For Resident Evil 2, install `re2_zfix.asi`. This build contains the most tuned
+model-depth path, including the crow-oriented adaptive depth profile, UV seam
+cleanup, alpha cutout handling, and model depth prepass. It writes
+`re2_zfix.log`.
+
+For Resident Evil 3 Classic Rebirth, install `re3_zfix.asi`. This build hooks
+the Classic Rebirth DirectDraw-to-D3D9 path, creates a stable depth surface when
+needed, and applies the RE3-specific model stabilization settings. It writes
+`re3_zfix.log`.
+
+### Verifying That The Plugin Loaded
+
+After launching the game, check the game folder for the matching log file:
+
+- `re1_zfix.log`
+- `re2_zfix.log`
+- `re3_zfix.log`
+
+If the log file appears and contains startup lines, the ASI was loaded. If no
+log file is created, the ASI loader did not load the plugin, the plugin is in
+the wrong folder, or the wrong plugin was copied for that game.
+
+### Updating Or Removing
+
+To update a fix, close the game and replace the old `.asi` with the new one.
+Keeping a backup such as `re2_zfix.asi.bak` is recommended.
+
+To disable a fix, rename the plugin so it no longer ends with `.asi`, for
+example:
+
+```text
+re2_zfix.asi.disabled
+```
+
+### Troubleshooting
+
+If the game crashes on startup, first remove or rename the plugin and confirm
+the game starts without it. Then check that the correct ASI was installed for
+the correct game.
+
+If models still flicker or show depth artifacts, keep the matching log file and
+test the same scene again. The logs contain draw-call and profile diagnostics
+that can be used to tune a safer per-game or per-model profile.
+
+## Experimental Model Polish Branch
+
+The `codex/experimental-model-polish` branch contains a more aggressive visual
+experiment for Resident Evil 1, Resident Evil 2, and Resident Evil 3.
+
+Resident Evil 1 and Resident Evil 2 get the full experimental stack:
+
+- adaptive room-style relighting based on the current model luma;
+- stronger screen-space directional/rim lighting;
+- half-pixel geometry stabilization for small or unstable model batches;
+- contact-shadow polishing for dark translucent blob-like draws;
+- sharper cutout alpha handling for hair, grates, feathers, and similar edges.
+
+Resident Evil 3 gets the safer subset: adaptive relighting and half-pixel model
+stabilization. The aggressive transparent/cutout path is intentionally not
+re-enabled there because earlier RE3 testing showed that transparent fixes can
+reintroduce z-fighting in some scenes.
 
 ## Notes
 
