@@ -299,6 +299,20 @@ static volatile LONG g_texture_handle_logged = 0;
 static volatile LONG g_texture_qi_seen = 0;
 static volatile LONG g_texture_binding_count = 0;
 static volatile LONG g_texture_binding_logged = 0;
+static volatile LONG g_high_poly_burst_logged = 0;
+static volatile LONG g_high_poly_constant_logged = 0;
+static DWORD g_high_poly_scene_tris = 0;
+static DWORD g_high_poly_scene_draws = 0;
+static DWORD g_high_poly_scene_vertices = 0;
+static DWORD g_high_poly_scene_max_draw_tris = 0;
+static DWORD g_high_poly_scene_max_draw_vertices = 0;
+static DWORD g_high_poly_max_scene_tris = 0;
+static DWORD g_high_poly_max_draw_tris = 0;
+static DWORD g_high_poly_max_draw_vertices = 0;
+static DWORD g_high_poly_burst_caller = 0;
+static DWORD g_high_poly_burst_tris = 0;
+static DWORD g_high_poly_burst_draws = 0;
+static DWORD g_high_poly_burst_vertices = 0;
 
 static const int g_enabled = 1;
 static const int g_diagnostics = 1;
@@ -356,6 +370,8 @@ static const int g_fallback_zbuffer_depth = 24;
 static const int g_texture_handle_trace = 1;
 static const int g_bad_draw_autologger = 1;
 static const int g_bad_draw_log_limit = 192;
+static const int g_high_poly_diagnostics = 1;
+static const int g_high_poly_scan_exe_constants = 1;
 
 static const float g_max_screen_extent = 360.0f;
 static const float g_max_screen_area = 60000.0f;
@@ -424,6 +440,10 @@ static const float g_adaptive_depth_small_min_extent = 3.0f;
 static const float g_adaptive_depth_small_strength = 0.55f;
 static const float g_adaptive_depth_rhw_signal = 0.00000001f;
 static const float g_adaptive_depth_axis_signal = 1.0f;
+static const DWORD g_high_poly_nominal_limit = 2700u;
+static const DWORD g_high_poly_near_limit_margin = 96u;
+static const DWORD g_high_poly_draw_log_tri_threshold = 1024u;
+static const DWORD g_high_poly_constant_scan_limit = 64u;
 static const DWORD g_model_callsite_min = 0x0040E000u;
 static const DWORD g_model_callsite_max = 0x0040F800u;
 static const DWORD g_re2_batched_model_callsite = 0x004080D8u;
@@ -812,6 +832,12 @@ static void LogDrawCallsiteSummary(const char* reason)
           g_experimental_subpixel_draws, g_experimental_subpixel_vertices,
           g_experimental_contact_shadow_draws, g_experimental_contact_shadow_vertices,
           g_experimental_cutout_alpha_draws, g_experimental_cutout_alpha_vertices);
+  LogLine("summary highpoly diagnostics=%d nominalLimit=%lu maxSceneTris=%lu "
+          "maxDrawTris=%lu maxDrawVerts=%lu burstLogged=%ld constantsLogged=%ld",
+          g_high_poly_diagnostics, g_high_poly_nominal_limit,
+          g_high_poly_max_scene_tris, g_high_poly_max_draw_tris,
+          g_high_poly_max_draw_vertices, g_high_poly_burst_logged,
+          g_high_poly_constant_logged);
   LogLine("summary texture_trace enabled=%d surfaces=%ld surfaceSlots=%ld surfaceLogged=%ld "
           "textureQI=%ld bindings=%ld bindingLogged=%ld handleCalls=%ld handles=%ld handleLogged=%ld",
           g_texture_handle_trace, g_texture_surface_seen, g_texture_surface_count,
@@ -830,6 +856,229 @@ static void LogDrawCallsiteSummary(const char* reason)
             site->seen, site->accepted_dp, site->accepted_dip, site->transparent_dp,
             site->transparent_dip, site->rejected, site->low_span, site->tiny_delta);
   }
+}
+
+static void HighPolyFlushBurst(const char* reason)
+{
+  if (!g_high_poly_diagnostics || !g_high_poly_burst_caller || g_high_poly_burst_tris == 0)
+    return;
+
+  const DWORD near_limit =
+    g_high_poly_nominal_limit > g_high_poly_near_limit_margin ?
+    (g_high_poly_nominal_limit - g_high_poly_near_limit_margin) : 0u;
+  const int interesting =
+    g_high_poly_burst_tris >= near_limit ||
+    g_high_poly_burst_tris > g_high_poly_max_scene_tris ||
+    g_high_poly_burst_tris > g_high_poly_max_draw_tris;
+
+  if (interesting)
+  {
+    const LONG logged = InterlockedIncrement(&g_high_poly_burst_logged);
+    if (logged <= 96)
+    {
+      ModuleAddressInfo info;
+      ResolveModuleForAddress(g_high_poly_burst_caller, &info);
+      LogLine("highpoly-burst #%ld reason=%s caller=%s+0x%08lX raw=0x%08lX "
+              "draws=%lu tris=%lu vertices=%lu nominalLimit=%lu near=%lu",
+              logged, reason ? reason : "flush", info.module_name, info.module_offset,
+              g_high_poly_burst_caller, g_high_poly_burst_draws,
+              g_high_poly_burst_tris, g_high_poly_burst_vertices,
+              g_high_poly_nominal_limit, near_limit);
+    }
+  }
+
+  g_high_poly_burst_caller = 0;
+  g_high_poly_burst_tris = 0;
+  g_high_poly_burst_draws = 0;
+  g_high_poly_burst_vertices = 0;
+}
+
+static void TrackHighPolyDraw(DWORD caller, int accepted, int indexed, DWORD primitive_type,
+                              DWORD vertex_count, DWORD index_count, DWORD tris,
+                              const DrawBounds* bounds, const char* reason)
+{
+  if (!g_high_poly_diagnostics || tris == 0)
+    return;
+
+  const DWORD effective_vertices = indexed && index_count ? index_count : vertex_count;
+  if (tris > g_high_poly_max_draw_tris)
+    g_high_poly_max_draw_tris = tris;
+  if (effective_vertices > g_high_poly_max_draw_vertices)
+    g_high_poly_max_draw_vertices = effective_vertices;
+  if (tris > g_high_poly_scene_max_draw_tris)
+    g_high_poly_scene_max_draw_tris = tris;
+  if (effective_vertices > g_high_poly_scene_max_draw_vertices)
+    g_high_poly_scene_max_draw_vertices = effective_vertices;
+
+  if (!accepted)
+  {
+    HighPolyFlushBurst(reason ? reason : "reject");
+    return;
+  }
+
+  g_high_poly_scene_tris += tris;
+  g_high_poly_scene_draws++;
+  g_high_poly_scene_vertices += effective_vertices;
+
+  if (g_high_poly_burst_caller && g_high_poly_burst_caller != caller)
+    HighPolyFlushBurst("caller-change");
+  if (!g_high_poly_burst_caller)
+    g_high_poly_burst_caller = caller;
+  g_high_poly_burst_tris += tris;
+  g_high_poly_burst_draws++;
+  g_high_poly_burst_vertices += effective_vertices;
+
+  if (tris >= g_high_poly_draw_log_tri_threshold)
+  {
+    const LONG logged = InterlockedIncrement(&g_high_poly_burst_logged);
+    if (logged <= 96)
+    {
+      ModuleAddressInfo info;
+      ResolveModuleForAddress(caller, &info);
+      LogLine("highpoly-draw #%ld caller=%s+0x%08lX raw=0x%08lX indexed=%d "
+              "type=%lu verts=%lu indices=%lu tris=%lu area=%.2f extent=%.2f",
+              logged, info.module_name, info.module_offset, caller, indexed,
+              primitive_type, vertex_count, index_count, tris,
+              bounds ? bounds->area : 0.0f,
+              bounds ? (AbsF(bounds->width) > AbsF(bounds->height) ?
+                        AbsF(bounds->width) : AbsF(bounds->height)) : 0.0f);
+    }
+  }
+}
+
+static void ResetHighPolySceneCounters(void)
+{
+  if (!g_high_poly_diagnostics)
+    return;
+  HighPolyFlushBurst("scene-begin");
+  g_high_poly_scene_tris = 0;
+  g_high_poly_scene_draws = 0;
+  g_high_poly_scene_vertices = 0;
+  g_high_poly_scene_max_draw_tris = 0;
+  g_high_poly_scene_max_draw_vertices = 0;
+}
+
+static void LogHighPolySceneSummary(LONG scene)
+{
+  if (!g_high_poly_diagnostics)
+    return;
+  HighPolyFlushBurst("scene-end");
+  if (g_high_poly_scene_tris > g_high_poly_max_scene_tris)
+    g_high_poly_max_scene_tris = g_high_poly_scene_tris;
+
+  const DWORD near_limit =
+    g_high_poly_nominal_limit > g_high_poly_near_limit_margin ?
+    (g_high_poly_nominal_limit - g_high_poly_near_limit_margin) : 0u;
+  if (scene <= 8 || g_high_poly_scene_tris >= near_limit ||
+      (scene % 120) == 0)
+  {
+    LogLine("highpoly-scene scene=%ld draws=%lu tris=%lu vertices=%lu "
+            "maxDrawTris=%lu maxDrawVerts=%lu maxSceneTris=%lu nominalLimit=%lu near=%lu",
+            scene, g_high_poly_scene_draws, g_high_poly_scene_tris,
+            g_high_poly_scene_vertices, g_high_poly_scene_max_draw_tris,
+            g_high_poly_scene_max_draw_vertices, g_high_poly_max_scene_tris,
+            g_high_poly_nominal_limit, near_limit);
+  }
+}
+
+static int IsReadableSectionName(const char name[8])
+{
+  for (int i = 0; i < 8 && name[i]; i++)
+  {
+    const unsigned char c = (unsigned char)name[i];
+    if (c < 32 || c > 126)
+      return 0;
+  }
+  return 1;
+}
+
+static void SectionNameText(const IMAGE_SECTION_HEADER* section, char* out, size_t out_size)
+{
+  if (!out || out_size == 0)
+    return;
+  out[0] = '\0';
+  if (!section || !IsReadableSectionName((const char*)section->Name))
+    return;
+  const size_t max_chars = out_size > 8 ? 8 : (out_size - 1);
+  size_t i = 0;
+  for (; i < max_chars && section->Name[i]; i++)
+    out[i] = (char)section->Name[i];
+  out[i] = '\0';
+}
+
+static void ScanHighPolyConstantsInExecutable(void)
+{
+  if (!g_high_poly_diagnostics || !g_high_poly_scan_exe_constants)
+    return;
+
+  HMODULE module = GetModuleHandleA(NULL);
+  if (!module)
+    return;
+
+  const BYTE* base = (const BYTE*)module;
+  const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return;
+  const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return;
+
+  const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+  const DWORD constants[] = {
+    2700u, 2699u, 2701u, 2800u, 3000u, 4096u, 8192u, 8100u, 5400u
+  };
+  const WORD constants16[] = {
+    2700u, 2699u, 2701u, 2800u, 3000u, 4096u, 8192u, 8100u, 5400u
+  };
+
+  for (WORD s = 0; s < nt->FileHeader.NumberOfSections; s++, section++)
+  {
+    const BYTE* data = base + section->VirtualAddress;
+    DWORD size = section->Misc.VirtualSize;
+    if (size == 0 || size > nt->OptionalHeader.SizeOfImage)
+      continue;
+    if (section->VirtualAddress + size > nt->OptionalHeader.SizeOfImage)
+      size = nt->OptionalHeader.SizeOfImage - section->VirtualAddress;
+
+    char section_name[12];
+    SectionNameText(section, section_name, sizeof(section_name));
+
+    for (DWORD i = 0; i + sizeof(DWORD) <= size; i++)
+    {
+      const DWORD value = *(const DWORD*)(const void*)(data + i);
+      for (DWORD c = 0; c < ARRAYSIZE(constants); c++)
+      {
+        if (value != constants[c])
+          continue;
+        const LONG logged = InterlockedIncrement(&g_high_poly_constant_logged);
+        if (logged <= (LONG)g_high_poly_constant_scan_limit)
+        {
+          LogLine("highpoly-constant #%ld width=32 value=%lu section=%s rva=0x%08lX va=%p",
+                  logged, value, section_name[0] ? section_name : "?",
+                  section->VirtualAddress + i, (void*)(uintptr_t)(data + i));
+        }
+      }
+    }
+
+    for (DWORD i = 0; i + sizeof(WORD) <= size; i++)
+    {
+      const WORD value = *(const WORD*)(const void*)(data + i);
+      for (DWORD c = 0; c < ARRAYSIZE(constants16); c++)
+      {
+        if (value != constants16[c])
+          continue;
+        const LONG logged = InterlockedIncrement(&g_high_poly_constant_logged);
+        if (logged <= (LONG)g_high_poly_constant_scan_limit)
+        {
+          LogLine("highpoly-constant #%ld width=16 value=%u section=%s rva=0x%08lX va=%p",
+                  logged, (unsigned)value, section_name[0] ? section_name : "?",
+                  section->VirtualAddress + i, (void*)(uintptr_t)(data + i));
+        }
+      }
+    }
+  }
+  LogLine("highpoly-constant scan done logged=%ld limit=%lu",
+          g_high_poly_constant_logged, g_high_poly_constant_scan_limit);
 }
 
 // Geometry classification helpers.
@@ -3563,6 +3812,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DTexture2_GetHandle(void* self, void* de
 static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_BeginScene(void* self)
 {
   g_model_depth_written_this_scene = 0;
+  ResetHighPolySceneCounters();
   ClearDepthBufferForScene(self);
   D3DDevice2BeginSceneProc orig = (D3DDevice2BeginSceneProc)GetOriginal(*(void***)self, 10);
   return orig ? orig(self) : D3D_OK;
@@ -3580,6 +3830,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_EndScene(void* self)
             g_zfight_sample_logged, g_model_depth_prepass_draws,
             g_model_depth_prepass_failures);
   }
+  LogHighPolySceneSummary(scene);
   if (scene == 60 || scene == 240 || (scene % 720) == 0)
     LogDrawCallsiteSummary("scene");
 
@@ -3637,6 +3888,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
       TrackDrawCallsite(caller, "accept", 0, 1, primitive_type, vertex_count, 0, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
+      TrackHighPolyDraw(caller, 1, 0, primitive_type, vertex_count, 0, tris,
+                        &transparent_bounds,
+                        alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent");
       return DrawPrimitiveWithTransparentModelDepth(self, orig, primitive_type, vertex_type, vertices,
                                                    vertex_count, flags, caller, &transparent_bounds,
                                                    alpha_class);
@@ -3645,6 +3899,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
     InterlockedIncrement(&g_draw_rejected);
     TrackDrawCallsite(caller, "reject", 0, 0, primitive_type, vertex_count, 0, tris,
                       reason, &bounds);
+    TrackHighPolyDraw(caller, 0, 0, primitive_type, vertex_count, 0, tris,
+                      &bounds, reason);
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, NULL, 0);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
   }
@@ -3652,6 +3908,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   InterlockedIncrement(&g_draw_model_accepted);
   TrackDrawCallsite(caller, "accept", 0, 0, primitive_type, vertex_count, 0, tris,
                     "ok", &bounds);
+  TrackHighPolyDraw(caller, 1, 0, primitive_type, vertex_count, 0, tris,
+                    &bounds, "accepted");
   return DrawPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count, flags,
                                      caller, tris, &bounds);
 }
@@ -3706,6 +3964,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
       TrackDrawCallsite(caller, "accept", 1, 1, primitive_type, vertex_count, index_count, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
+      TrackHighPolyDraw(caller, 1, 1, primitive_type, vertex_count, index_count, tris,
+                        &transparent_bounds,
+                        alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent");
       return DrawIndexedPrimitiveWithTransparentModelDepth(self, orig, primitive_type, vertex_type, vertices,
                                                           vertex_count, indices, index_count, flags,
                                                           caller, &transparent_bounds, alpha_class);
@@ -3732,6 +3993,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
       TrackDrawCallsite(caller, "reject", 1, 0, primitive_type, vertex_count, index_count, tris,
                         reason ? reason : "bad_indices", &bounds);
     }
+    TrackHighPolyDraw(caller, 0, 1, primitive_type, vertex_count, index_count, tris,
+                      &bounds, bounds_ok ? reason : (reason ? reason : "bad_indices"));
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, indices, index_count);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
   }
@@ -3739,6 +4002,8 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   InterlockedIncrement(&g_draw_indexed_model_accepted);
   TrackDrawCallsite(caller, "accept", 1, 0, primitive_type, vertex_count, index_count, tris,
                     "ok", &bounds);
+  TrackHighPolyDraw(caller, 1, 1, primitive_type, vertex_count, index_count, tris,
+                    &bounds, "accepted");
   return DrawIndexedPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count,
                                             indices, index_count, flags, caller, &bounds);
 }
@@ -3919,6 +4184,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_experimental_alpha_cutout_deluxe, g_experimental_room_target_luma,
             g_experimental_room_relight_max, g_experimental_half_pixel_strength,
             g_experimental_contact_shadow_max_luma, g_experimental_contact_shadow_output_alpha);
+    LogLine("highpoly diagnostics=%d nominalLimit=%lu nearMargin=%lu drawLogTris=%lu scanConstants=%d",
+            g_high_poly_diagnostics, g_high_poly_nominal_limit,
+            g_high_poly_near_limit_margin, g_high_poly_draw_log_tri_threshold,
+            g_high_poly_scan_exe_constants);
+    ScanHighPolyConstantsInExecutable();
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
   }
   else if (reason == DLL_PROCESS_DETACH)
