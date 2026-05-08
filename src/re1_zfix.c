@@ -12,7 +12,7 @@
 #pragma intrinsic(_ReturnAddress)
 #endif
 
-// DirectDraw and Direct3D 2 compatibility declarations.
+// DirectDraw and legacy Direct3D compatibility declarations.
 #define D3D_OK 0
 #define D3DVT_TLVERTEX 3
 #define D3DPT_LINELIST 2
@@ -72,6 +72,11 @@
 #define D3DBLEND_ZERO 1
 #define D3DBLEND_ONE 2
 #define D3DCULL_NONE 1
+#define D3DOP_TRIANGLE 3
+#define D3DOP_STATERENDER 8
+#define D3DOP_EXIT 11
+#define D3DDEB_BUFSIZE 0x00000001u
+#define D3DDEB_LPDATA 0x00000004u
 
 #include "zfix_common.h"
 #include "zfix_hooks.h"
@@ -128,10 +133,69 @@ typedef struct DDSURFACEDESC_COMPAT {
   DDSCAPS_COMPAT ddsCaps;
 } DDSURFACEDESC_COMPAT;
 
+typedef struct D3DRECT_COMPAT {
+  LONG x1;
+  LONG y1;
+  LONG x2;
+  LONG y2;
+} D3DRECT_COMPAT;
+
+typedef struct D3DSTATUS_COMPAT {
+  DWORD flags;
+  DWORD status;
+  D3DRECT_COMPAT extent;
+} D3DSTATUS_COMPAT;
+
+typedef struct D3DEXECUTEDATA_COMPAT {
+  DWORD size;
+  DWORD vertex_offset;
+  DWORD vertex_count;
+  DWORD instruction_offset;
+  DWORD instruction_length;
+  DWORD hvertex_offset;
+  D3DSTATUS_COMPAT status;
+} D3DEXECUTEDATA_COMPAT;
+
+typedef struct D3DEXECUTEBUFFERDESC_COMPAT {
+  DWORD size;
+  DWORD flags;
+  DWORD caps;
+  DWORD buffer_size;
+  void* data;
+} D3DEXECUTEBUFFERDESC_COMPAT;
+
+typedef struct D3DINSTRUCTION_COMPAT {
+  BYTE opcode;
+  BYTE size;
+  WORD count;
+} D3DINSTRUCTION_COMPAT;
+
+typedef struct D3DSTATE_COMPAT {
+  DWORD state;
+  DWORD value;
+} D3DSTATE_COMPAT;
+
+typedef struct D3DTRIANGLE_COMPAT {
+  WORD v1;
+  WORD v2;
+  WORD v3;
+  WORD flags;
+} D3DTRIANGLE_COMPAT;
+
 typedef HRESULT(WINAPI* DirectDrawCreateProc)(GUID* lpGUID, void** lplpDD, void* pUnkOuter);
 typedef HRESULT(STDMETHODCALLTYPE* DirectDrawCreateSurfaceProc)(void* self, DDSURFACEDESC_COMPAT* desc,
                                                                 void** surface, void* outer);
 typedef HRESULT(STDMETHODCALLTYPE* QueryInterfaceProc)(void* self, REFIID riid, void** ppvObj);
+typedef HRESULT(STDMETHODCALLTYPE* D3DDeviceCreateExecuteBufferProc)(void* self,
+                                                                     D3DEXECUTEBUFFERDESC_COMPAT* desc,
+                                                                     void** execute_buffer, void* outer);
+typedef HRESULT(STDMETHODCALLTYPE* D3DDeviceExecuteProc)(void* self, void* execute_buffer, void* viewport, DWORD flags);
+typedef HRESULT(STDMETHODCALLTYPE* D3DDeviceBeginSceneProc)(void* self);
+typedef HRESULT(STDMETHODCALLTYPE* D3DDeviceEndSceneProc)(void* self);
+typedef HRESULT(STDMETHODCALLTYPE* D3DExecuteBufferLockProc)(void* self, D3DEXECUTEBUFFERDESC_COMPAT* desc);
+typedef HRESULT(STDMETHODCALLTYPE* D3DExecuteBufferUnlockProc)(void* self);
+typedef HRESULT(STDMETHODCALLTYPE* D3DExecuteBufferGetExecuteDataProc)(void* self,
+                                                                       D3DEXECUTEDATA_COMPAT* data);
 typedef HRESULT(STDMETHODCALLTYPE* D3D2CreateDeviceProc)(void* self, REFCLSID rclsid, void* surface, void** device);
 typedef HRESULT(STDMETHODCALLTYPE* D3DDevice2BeginSceneProc)(void* self);
 typedef HRESULT(STDMETHODCALLTYPE* D3DDevice2EndSceneProc)(void* self);
@@ -150,10 +214,24 @@ typedef HRESULT(STDMETHODCALLTYPE* D3DViewport2ClearProc)(void* self, DWORD coun
 
 static const GUID kIID_IDirectDraw2 =
   {0xB3A6F3E0, 0x2B43, 0x11CF, {0xA2, 0xDE, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+static const GUID kIID_IDirect3D =
+  {0x3BBA0080, 0x2421, 0x11CF, {0xA3, 0x1A, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+static const GUID kIID_IDirect3DRampDevice =
+  {0xF2086B20, 0x259F, 0x11CF, {0xA3, 0x1A, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+static const GUID kIID_IDirect3DRGBDevice =
+  {0xA4665C60, 0x2673, 0x11CF, {0xA3, 0x1A, 0x00, 0xAA, 0x00, 0xB9, 0x33, 0x56}};
+static const GUID kIID_IDirect3DHALDevice =
+  {0x84E63DE0, 0x46AA, 0x11CF, {0x81, 0x6F, 0x00, 0x00, 0xC0, 0x20, 0x15, 0x6E}};
+static const GUID kIID_IDirect3DMMXDevice =
+  {0x881949A1, 0xD6F3, 0x11D0, {0x89, 0xAB, 0x00, 0xA0, 0xC9, 0x05, 0x41, 0x29}};
 static const GUID kIID_IDirect3D2 =
   {0x6aae1ec1, 0x662a, 0x11d0, {0x88, 0x9d, 0x00, 0xaa, 0x00, 0xbb, 0xb7, 0x6a}};
+static const GUID kIID_IDirect3DDevice =
+  {0x64108800, 0x957d, 0x11d0, {0x89, 0xab, 0x00, 0xa0, 0xc9, 0x05, 0x41, 0x29}};
 static const GUID kIID_IDirect3DDevice2 =
   {0x93281501, 0x8cf8, 0x11d0, {0x89, 0xab, 0x00, 0xa0, 0xc9, 0x05, 0x41, 0x29}};
+static const GUID kIID_IDirect3DExecuteBuffer =
+  {0x4417C145, 0x33AD, 0x11CF, {0x81, 0x6F, 0x00, 0x00, 0xC0, 0x20, 0x15, 0x6E}};
 static const GUID kIID_IDirect3DTexture2 =
   {0x93281502, 0x8cf8, 0x11d0, {0x89, 0xab, 0x00, 0xa0, 0xc9, 0x05, 0x41, 0x29}};
 
@@ -292,6 +370,12 @@ static volatile LONG g_texture_handle_logged = 0;
 static volatile LONG g_texture_qi_seen = 0;
 static volatile LONG g_texture_binding_count = 0;
 static volatile LONG g_texture_binding_logged = 0;
+static volatile LONG g_d3d1_device_seen = 0;
+static volatile LONG g_d3d1_execute_seen = 0;
+static volatile LONG g_d3d1_execute_logged = 0;
+static volatile LONG g_d3d1_execute_patched = 0;
+static volatile LONG g_d3d1_shadow_state_patches = 0;
+static volatile LONG g_d3d1_qi_logged = 0;
 
 static const int g_enabled = 1;
 static const int g_diagnostics = 1;
@@ -310,7 +394,7 @@ static const int g_skip_axis_tile_draws = 1;
 static const int g_precise_min_vertex_alpha = 250;
 static const int g_single_triangle_dp_only = 1;
 static const int g_allow_indexed_model_draws = 1;
-static const int g_require_model_callsite = 1;
+static const int g_require_model_callsite = 0;
 static const int g_clear_model_depth_before_2d = 1;
 static const int g_transparent_model_z_test = 1;
 static const int g_transparent_model_z_write = 0;
@@ -344,6 +428,8 @@ static const int g_fallback_zbuffer_depth = 24;
 static const int g_texture_handle_trace = 1;
 static const int g_bad_draw_autologger = 1;
 static const int g_bad_draw_log_limit = 192;
+static const int g_re1_d3d1_execute_shadow_clip = 1;
+static const int g_re1_d3d1_query_logging = 1;
 
 static const float g_max_screen_extent = 360.0f;
 static const float g_max_screen_area = 60000.0f;
@@ -400,14 +486,14 @@ static const float g_adaptive_depth_rhw_signal = 0.00000001f;
 static const float g_adaptive_depth_axis_signal = 1.0f;
 static const DWORD g_model_callsite_min = 0x0040E000u;
 static const DWORD g_model_callsite_max = 0x0040F800u;
-static const DWORD g_re2_batched_model_callsite = 0x004080D8u;
+static const DWORD g_re1_batched_model_callsite = 0x004080D8u;
 static const DWORD g_batched_model_max_vertices = 768u;
 static const float g_batched_model_max_screen_extent = 960.0f;
 static const float g_batched_model_max_screen_area = 420000.0f;
 
 static const ZfixCallsiteProfile g_callsite_profiles[] = {
   {
-    "re2-crow-v2-micro-flat",
+    "re1-re2base-crow-micro-flat",
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
@@ -433,7 +519,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0.000400f
   },
   {
-    "re2-crow-v2-mid-detail",
+    "re1-re2base-crow-mid-detail",
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
@@ -459,7 +545,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0.000440f
   },
   {
-    "re2-crow-v2-wide-depth",
+    "re1-re2base-crow-wide-depth",
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
@@ -485,7 +571,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0.000420f
   },
   {
-    "re2-batched-model",
+    "re1-re2base-batched-model",
     0x004080D8u,
     0x004080D8u,
     ZFIX_DEPTH_PROFILE_NORMAL,
@@ -511,7 +597,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0.0f
   },
   {
-    "re2-model-range",
+    "re1-re2base-model-range",
     0x0040E000u,
     0x0040F800u,
     ZFIX_DEPTH_PROFILE_NORMAL,
@@ -579,7 +665,10 @@ static int PatchVTableSlot(void* obj, int slot, void* hook);
 static void LogLine(const char* fmt, ...);
 static TextureSurfaceTrace* FindTextureSurface(void* surface);
 static TextureHandleTrace* FindTextureHandleTraceByHandle(DWORD handle);
+static void PatchD3DDevice(void* device);
 static void PatchD3DDevice2(void* device);
+static void PatchD3DExecuteBuffer(void* execute_buffer);
+static void UnlockExecuteBufferData(void* execute_buffer);
 static void ClearDepthBuffer(void* self);
 static void ClearDepthBufferForScene(void* self);
 static void ClearModelDepthBeforeKnown2D(void* self, DWORD caller, DWORD vertex_type,
@@ -592,13 +681,20 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
 static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC_COMPAT* desc,
                                                        void** surface, void* outer);
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj);
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_CreateExecuteBuffer(void* self,
+                                                                    D3DEXECUTEBUFFERDESC_COMPAT* desc,
+                                                                    void** execute_buffer, void* outer);
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_Execute(void* self, void* execute_buffer,
+                                                        void* viewport, DWORD flags);
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_BeginScene(void* self);
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_EndScene(void* self);
 static HRESULT STDMETHODCALLTYPE Hook_D3D2_CreateDevice(void* self, REFCLSID rclsid, void* surface, void** device);
 static HRESULT STDMETHODCALLTYPE Hook_D3DTexture2_GetHandle(void* self, void* device, DWORD* handle);
 
 static void BuildLogPath(HINSTANCE instance)
 {
   ZfixBuildLogPath(instance, g_game_dir, sizeof(g_game_dir),
-                   g_log_path, sizeof(g_log_path), "re2_zfix.log");
+                   g_log_path, sizeof(g_log_path), "re1_zfix.log");
 }
 
 static void LogLine(const char* fmt, ...)
@@ -783,6 +879,10 @@ static void LogDrawCallsiteSummary(const char* reason)
           g_texture_surface_logged, g_texture_qi_seen, g_texture_binding_count,
           g_texture_binding_logged, g_texture_handle_seen, g_texture_handle_count,
           g_texture_handle_logged);
+  LogLine("summary re1_d3d1 devices=%ld executes=%ld patchedExecutes=%ld shadowStatePatches=%ld qiLogged=%ld shadowClip=%d",
+          g_d3d1_device_seen, g_d3d1_execute_seen, g_d3d1_execute_patched,
+          g_d3d1_shadow_state_patches, g_d3d1_qi_logged,
+          g_re1_d3d1_execute_shadow_clip);
   for (LONG i = 0; i < count; i++)
   {
     DrawCallsiteStats* site = &g_draw_callsites[i];
@@ -1099,7 +1199,7 @@ static int IsModelCallsite(DWORD caller)
 
 static int IsBatchedModelCallsite(DWORD caller)
 {
-  return caller == g_re2_batched_model_callsite;
+  return caller == g_re1_batched_model_callsite;
 }
 
 static int IsAcceptedModelCallsite(DWORD caller)
@@ -2861,6 +2961,156 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
   return hr;
 }
 
+static int LockExecuteBufferData(void* execute_buffer, D3DEXECUTEDATA_COMPAT* exec_data,
+                                 D3DEXECUTEBUFFERDESC_COMPAT* desc)
+{
+  if (!execute_buffer || !exec_data || !desc)
+    return 0;
+
+  D3DExecuteBufferGetExecuteDataProc get_data =
+    (D3DExecuteBufferGetExecuteDataProc)GetVTableSlot(execute_buffer, 7);
+  D3DExecuteBufferLockProc lock =
+    (D3DExecuteBufferLockProc)GetVTableSlot(execute_buffer, 4);
+  if (!get_data || !lock)
+    return 0;
+
+  memset(exec_data, 0, sizeof(*exec_data));
+  exec_data->size = sizeof(*exec_data);
+  if (FAILED(get_data(execute_buffer, exec_data)))
+    return 0;
+
+  memset(desc, 0, sizeof(*desc));
+  desc->size = sizeof(*desc);
+  desc->flags = D3DDEB_BUFSIZE | D3DDEB_LPDATA;
+  if (FAILED(lock(execute_buffer, desc)))
+    return 0;
+  if (!desc->data || desc->buffer_size == 0)
+  {
+    UnlockExecuteBufferData(execute_buffer);
+    return 0;
+  }
+
+  return 1;
+}
+
+static void UnlockExecuteBufferData(void* execute_buffer)
+{
+  D3DExecuteBufferUnlockProc unlock =
+    (D3DExecuteBufferUnlockProc)GetVTableSlot(execute_buffer, 5);
+  if (unlock)
+    unlock(execute_buffer);
+}
+
+static int PatchStateValue(D3DSTATE_COMPAT* state, DWORD value)
+{
+  if (!state || state->value == value)
+    return 0;
+  state->value = value;
+  return 1;
+}
+
+static DWORD PatchD3D1ExecuteBufferForShadowClip(void* execute_buffer, DWORD* triangle_count,
+                                                 DWORD* alpha_triangle_count)
+{
+  if (!g_re1_d3d1_execute_shadow_clip || !execute_buffer)
+    return 0;
+
+  if (triangle_count)
+    *triangle_count = 0;
+  if (alpha_triangle_count)
+    *alpha_triangle_count = 0;
+
+  D3DEXECUTEDATA_COMPAT exec_data;
+  D3DEXECUTEBUFFERDESC_COMPAT desc;
+  if (!LockExecuteBufferData(execute_buffer, &exec_data, &desc))
+    return 0;
+
+  DWORD patches = 0;
+  BYTE* mutable_base = (BYTE*)desc.data;
+  const DWORD buffer_size = desc.buffer_size;
+  if (exec_data.instruction_offset < buffer_size &&
+      exec_data.instruction_length <= buffer_size - exec_data.instruction_offset)
+  {
+    BYTE* ip = mutable_base + exec_data.instruction_offset;
+    BYTE* end = ip + exec_data.instruction_length;
+    int alpha_active = 0;
+    D3DSTATE_COMPAT* last_z_enable = NULL;
+    D3DSTATE_COMPAT* last_z_write = NULL;
+    D3DSTATE_COMPAT* last_z_func = NULL;
+    DWORD local_tris = 0;
+    DWORD local_alpha_tris = 0;
+
+    while (ip + sizeof(D3DINSTRUCTION_COMPAT) <= end)
+    {
+      D3DINSTRUCTION_COMPAT* instr = (D3DINSTRUCTION_COMPAT*)ip;
+      ip += sizeof(D3DINSTRUCTION_COMPAT);
+      if (instr->opcode == D3DOP_EXIT)
+        break;
+      if (instr->size == 0)
+        break;
+      const DWORD payload_size = (DWORD)instr->size * (DWORD)instr->count;
+      if (payload_size > (DWORD)(end - ip))
+        break;
+
+      if (instr->opcode == D3DOP_STATERENDER &&
+          instr->size >= sizeof(D3DSTATE_COMPAT))
+      {
+        D3DSTATE_COMPAT* states = (D3DSTATE_COMPAT*)ip;
+        const DWORD count = instr->count;
+        for (DWORD i = 0; i < count; i++)
+        {
+          D3DSTATE_COMPAT* state = &states[i];
+          if ((BYTE*)(state + 1) > end)
+            break;
+          if (state->state == D3DRENDERSTATE_ALPHABLENDENABLE)
+            alpha_active = state->value != 0;
+          else if (state->state == D3DRENDERSTATE_ZENABLE)
+          {
+            last_z_enable = state;
+            if (alpha_active)
+              patches += PatchStateValue(state, 1);
+          }
+          else if (state->state == D3DRENDERSTATE_ZWRITEENABLE)
+          {
+            last_z_write = state;
+            if (alpha_active)
+              patches += PatchStateValue(state, 0);
+          }
+          else if (state->state == D3DRENDERSTATE_ZFUNC)
+          {
+            last_z_func = state;
+            if (alpha_active && state->value == D3DCMP_ALWAYS)
+              patches += PatchStateValue(state, D3DCMP_LESSEQUAL);
+          }
+        }
+      }
+      else if (instr->opcode == D3DOP_TRIANGLE &&
+               instr->size >= sizeof(D3DTRIANGLE_COMPAT))
+      {
+        local_tris += instr->count;
+        if (alpha_active)
+        {
+          local_alpha_tris += instr->count;
+          patches += PatchStateValue(last_z_enable, 1);
+          patches += PatchStateValue(last_z_write, 0);
+          if (last_z_func && last_z_func->value == D3DCMP_ALWAYS)
+            patches += PatchStateValue(last_z_func, D3DCMP_LESSEQUAL);
+        }
+      }
+
+      ip += payload_size;
+    }
+
+    if (triangle_count)
+      *triangle_count = local_tris;
+    if (alpha_triangle_count)
+      *alpha_triangle_count = local_alpha_tris;
+  }
+
+  UnlockExecuteBufferData(execute_buffer);
+  return patches;
+}
+
 static void* GetOriginal(void** vtable, int slot)
 {
   return ZfixGetOriginal(g_hooks, &g_hook_count, vtable, slot);
@@ -2875,6 +3125,59 @@ static int PatchVTableSlot(void* obj, int slot, void* hook)
 static int IsGuid(REFIID a, const GUID* b)
 {
   return a && b && memcmp(a, b, sizeof(GUID)) == 0;
+}
+
+static int IsD3D1DeviceGuid(REFIID riid)
+{
+  return IsGuid(riid, &kIID_IDirect3DDevice) ||
+         IsGuid(riid, &kIID_IDirect3DRampDevice) ||
+         IsGuid(riid, &kIID_IDirect3DRGBDevice) ||
+         IsGuid(riid, &kIID_IDirect3DHALDevice) ||
+         IsGuid(riid, &kIID_IDirect3DMMXDevice);
+}
+
+static const char* KnownGuidName(REFIID riid)
+{
+  if (IsGuid(riid, &kIID_IDirectDraw2))
+    return "IDirectDraw2";
+  if (IsGuid(riid, &kIID_IDirect3D))
+    return "IDirect3D";
+  if (IsGuid(riid, &kIID_IDirect3DRampDevice))
+    return "IDirect3DRampDevice";
+  if (IsGuid(riid, &kIID_IDirect3DRGBDevice))
+    return "IDirect3DRGBDevice";
+  if (IsGuid(riid, &kIID_IDirect3DHALDevice))
+    return "IDirect3DHALDevice";
+  if (IsGuid(riid, &kIID_IDirect3DMMXDevice))
+    return "IDirect3DMMXDevice";
+  if (IsGuid(riid, &kIID_IDirect3D2))
+    return "IDirect3D2";
+  if (IsGuid(riid, &kIID_IDirect3DDevice))
+    return "IDirect3DDevice";
+  if (IsGuid(riid, &kIID_IDirect3DDevice2))
+    return "IDirect3DDevice2";
+  if (IsGuid(riid, &kIID_IDirect3DExecuteBuffer))
+    return "IDirect3DExecuteBuffer";
+  if (IsGuid(riid, &kIID_IDirect3DTexture2))
+    return "IDirect3DTexture2";
+  return "unknown";
+}
+
+static void GuidToText(REFIID guid, char* out, size_t out_size)
+{
+  if (!out || out_size == 0)
+    return;
+  if (!guid)
+  {
+    snprintf(out, out_size, "(null)");
+    return;
+  }
+
+  snprintf(out, out_size,
+           "{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+           (unsigned long)guid->Data1, guid->Data2, guid->Data3,
+           guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
+           guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
 }
 
 static int IsZBufferSurfaceDesc(const DDSURFACEDESC_COMPAT* desc)
@@ -3230,7 +3533,19 @@ static void ClassifyAndPatch(void* obj, REFIID riid)
 
   PatchVTableSlot(obj, 0, (void*)Hook_QueryInterface);
 
-  if (IsGuid(riid, &kIID_IDirect3D2))
+  if (IsGuid(riid, &kIID_IDirect3D))
+  {
+    LogLine("re1 d3d1 interface observed obj=%p", obj);
+  }
+  else if (IsD3D1DeviceGuid(riid))
+  {
+    PatchD3DDevice(obj);
+  }
+  else if (IsGuid(riid, &kIID_IDirect3DExecuteBuffer))
+  {
+    PatchD3DExecuteBuffer(obj);
+  }
+  else if (IsGuid(riid, &kIID_IDirect3D2))
   {
     PatchVTableSlot(obj, 8, (void*)Hook_D3D2_CreateDevice);
   }
@@ -3257,6 +3572,18 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
   HRESULT hr = orig(self, riid, ppvObj);
   if (SUCCEEDED(hr) && ppvObj && *ppvObj)
   {
+    if (g_re1_d3d1_query_logging)
+    {
+      const char* name = KnownGuidName(riid);
+      const LONG logged = InterlockedIncrement(&g_d3d1_qi_logged);
+      if (logged <= 96 || strcmp(name, "unknown") != 0)
+      {
+        char guid_text[64];
+        GuidToText(riid, guid_text, sizeof(guid_text));
+        LogLine("re1 qi #%ld self=%p iid=%s %s hr=0x%08lX out=%p",
+                logged, self, name, guid_text, (unsigned long)hr, *ppvObj);
+      }
+    }
     if (IsGuid(riid, &kIID_IDirect3DTexture2))
       TraceTextureQueryInterface(self, *ppvObj);
     ClassifyAndPatch(*ppvObj, riid);
@@ -3461,6 +3788,29 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
 }
 
 // Vtable and import patching.
+static void PatchD3DExecuteBuffer(void* execute_buffer)
+{
+  if (!execute_buffer)
+    return;
+  PatchVTableSlot(execute_buffer, 0, (void*)Hook_QueryInterface);
+}
+
+static void PatchD3DDevice(void* device)
+{
+  if (!device)
+    return;
+
+  const LONG seen = InterlockedIncrement(&g_d3d1_device_seen);
+  if (seen <= 8)
+    LogLine("re1 d3d1 device patched #%ld device=%p", seen, device);
+
+  PatchVTableSlot(device, 0, (void*)Hook_QueryInterface);
+  PatchVTableSlot(device, 6, (void*)Hook_D3DDevice_CreateExecuteBuffer);
+  PatchVTableSlot(device, 8, (void*)Hook_D3DDevice_Execute);
+  PatchVTableSlot(device, 19, (void*)Hook_D3DDevice_BeginScene);
+  PatchVTableSlot(device, 20, (void*)Hook_D3DDevice_EndScene);
+}
+
 static void PatchD3DDevice2(void* device)
 {
   if (!device)
@@ -3472,6 +3822,72 @@ static void PatchD3DDevice2(void* device)
   PatchVTableSlot(device, 23, (void*)Hook_D3DDevice2_SetRenderState);
   PatchVTableSlot(device, 29, (void*)Hook_D3DDevice2_DrawPrimitive);
   PatchVTableSlot(device, 30, (void*)Hook_D3DDevice2_DrawIndexedPrimitive);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_CreateExecuteBuffer(void* self,
+                                                                    D3DEXECUTEBUFFERDESC_COMPAT* desc,
+                                                                    void** execute_buffer, void* outer)
+{
+  D3DDeviceCreateExecuteBufferProc orig =
+    (D3DDeviceCreateExecuteBufferProc)GetOriginal(*(void***)self, 6);
+  if (!orig)
+    return E_FAIL;
+
+  HRESULT hr = orig(self, desc, execute_buffer, outer);
+  if (SUCCEEDED(hr) && execute_buffer && *execute_buffer)
+  {
+    PatchD3DExecuteBuffer(*execute_buffer);
+    const LONG logged = InterlockedIncrement(&g_d3d1_execute_logged);
+    if (logged <= 32)
+      LogLine("re1 d3d1 execute-buffer create #%ld buffer=%p size=%lu flags=0x%08lX",
+              logged, *execute_buffer, desc ? desc->buffer_size : 0,
+              desc ? desc->flags : 0);
+  }
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_Execute(void* self, void* execute_buffer,
+                                                        void* viewport, DWORD flags)
+{
+  D3DDeviceExecuteProc orig = (D3DDeviceExecuteProc)GetOriginal(*(void***)self, 8);
+  if (!orig)
+    return E_FAIL;
+
+  DWORD tris = 0;
+  DWORD alpha_tris = 0;
+  const DWORD patches = PatchD3D1ExecuteBufferForShadowClip(execute_buffer, &tris, &alpha_tris);
+  const LONG seen = InterlockedIncrement(&g_d3d1_execute_seen);
+  if (patches)
+  {
+    InterlockedIncrement(&g_d3d1_execute_patched);
+    InterlockedExchangeAdd(&g_d3d1_shadow_state_patches, (LONG)patches);
+  }
+  if (seen <= 96 || patches || (seen % 3600) == 0)
+  {
+    LogLine("re1 d3d1 execute #%ld buffer=%p viewport=%p flags=0x%08lX tris=%lu alphaTris=%lu patches=%lu",
+            seen, execute_buffer, viewport, flags, tris, alpha_tris, patches);
+  }
+
+  return orig(self, execute_buffer, viewport, flags);
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_BeginScene(void* self)
+{
+  D3DDeviceBeginSceneProc orig = (D3DDeviceBeginSceneProc)GetOriginal(*(void***)self, 19);
+  return orig ? orig(self) : D3D_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_EndScene(void* self)
+{
+  const LONG scene = InterlockedIncrement(&g_scene_counter);
+  if (scene <= 8 || (scene % 120) == 0)
+  {
+    LogLine("re1 d3d1 scene=%ld executes=%ld patched=%ld shadowStatePatches=%ld",
+            scene, g_d3d1_execute_seen, g_d3d1_execute_patched,
+            g_d3d1_shadow_state_patches);
+  }
+  D3DDeviceEndSceneProc orig = (D3DDeviceEndSceneProc)GetOriginal(*(void***)self, 20);
+  return orig ? orig(self) : D3D_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D2_CreateDevice(void* self, REFCLSID rclsid, void* surface, void** device)
@@ -3586,8 +4002,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     DisableThreadLibraryCalls(instance);
     for (DWORD i = 0; i < ARRAYSIZE(g_render_state_cache); i++)
       g_render_state_cache[i] = 0xFFFFFFFFu;
-    LogLine("re2_zfix loaded diagnostics=%d model_callsite=0x%08lX..0x%08lX",
-            g_diagnostics, g_model_callsite_min, g_model_callsite_max);
+    LogLine("re1_zfix loaded diagnostics=%d model_callsiteRequired=%d range=0x%08lX..0x%08lX",
+            g_diagnostics, g_require_model_callsite, g_model_callsite_min, g_model_callsite_max);
     LogLine("depth zbuffer=%d/%d clearEachScene=%d prepass=%d colorZWrite=%d colorZFunc=%d alphaRef=%lu",
             g_preferred_zbuffer_depth, g_fallback_zbuffer_depth, g_clear_depth_each_scene,
             g_model_depth_prepass, g_model_color_pass_z_write, g_model_color_pass_z_func,
@@ -3629,6 +4045,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_model_lighting_gain, g_model_lighting_saturation,
             g_model_lighting_direct, g_model_lighting_rim,
             g_model_lighting_max_luma_boost);
+    LogLine("re1 d3d1 execute shadowClip=%d qiLogging=%d",
+            g_re1_d3d1_execute_shadow_clip, g_re1_d3d1_query_logging);
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
   }
   else if (reason == DLL_PROCESS_DETACH)

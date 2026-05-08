@@ -15,17 +15,27 @@
 #define D3DPT_TRIANGLELIST 4
 #define D3DPT_TRIANGLESTRIP 5
 #define D3DPT_TRIANGLEFAN 6
+#define D3DCMP_LESS 2
 #define D3DCMP_EQUAL 3
 #define D3DCMP_LESSEQUAL 4
+#define D3DCMP_GREATER 5
 #define D3DRS_ZENABLE 7
 #define D3DRS_SHADEMODE 9
 #define D3DRS_ZWRITEENABLE 14
 #define D3DRS_ALPHATESTENABLE 15
+#define D3DRS_SRCBLEND 19
+#define D3DRS_DESTBLEND 20
+#define D3DRS_CULLMODE 22
 #define D3DRS_ZFUNC 23
+#define D3DRS_ALPHAREF 24
+#define D3DRS_ALPHAFUNC 25
 #define D3DRS_DITHERENABLE 26
 #define D3DRS_ALPHABLENDENABLE 27
 #define D3DRS_COLORWRITEENABLE 168
 #define D3D_COLORWRITE_ALL 0x0000000Fu
+#define D3DBLEND_SRCALPHA 5
+#define D3DBLEND_INVSRCALPHA 6
+#define D3DCULL_NONE 1
 #define D3DCLEAR_ZBUFFER 0x00000002u
 #define D3DSHADE_GOURAUD 2
 #define D3DBACKBUFFER_TYPE_MONO 0
@@ -125,12 +135,26 @@ typedef struct D3D9StateSnapshot {
   DWORD z_enable;
   DWORD z_write;
   DWORD z_func;
+  DWORD alpha_test;
+  DWORD alpha_ref;
+  DWORD alpha_func;
+  DWORD alpha_blend;
+  DWORD src_blend;
+  DWORD dest_blend;
+  DWORD cull_mode;
   DWORD color_write;
   DWORD shade_mode;
   DWORD dither_enable;
   int has_z_enable;
   int has_z_write;
   int has_z_func;
+  int has_alpha_test;
+  int has_alpha_ref;
+  int has_alpha_func;
+  int has_alpha_blend;
+  int has_src_blend;
+  int has_dest_blend;
+  int has_cull_mode;
   int has_color_write;
   int has_shade_mode;
   int has_dither_enable;
@@ -162,6 +186,9 @@ static volatile LONG g_dip_calls = 0;
 static volatile LONG g_dipup_total = 0;
 static volatile LONG g_dipup_accepted = 0;
 static volatile LONG g_dipup_rejected = 0;
+static volatile LONG g_dpup_transparent_accepted = 0;
+static volatile LONG g_dpup_cutout_accepted = 0;
+static volatile LONG g_dipup_cutout_accepted = 0;
 static volatile LONG g_frame_counter = 0;
 static volatile LONG g_model_uv_corrected_draws = 0;
 static volatile LONG g_model_uv_corrected_coords = 0;
@@ -169,8 +196,8 @@ static volatile LONG g_model_depth_prepass_draws = 0;
 static volatile LONG g_model_depth_prepass_failures = 0;
 static volatile LONG g_model_lighting_draws = 0;
 static volatile LONG g_model_lighting_vertices = 0;
-static volatile LONG g_model_geometry_stabilized_draws = 0;
-static volatile LONG g_model_geometry_stabilized_vertices = 0;
+static volatile LONG g_model_cutout_expanded_draws = 0;
+static volatile LONG g_model_cutout_expanded_vertices = 0;
 static volatile LONG g_callsite_profile_hits = 0;
 static volatile LONG g_adaptive_depth_draws = 0;
 static volatile LONG g_adaptive_depth_vertices = 0;
@@ -200,6 +227,9 @@ static const int g_clear_depth_each_scene = 1;
 static const int g_model_depth_prepass = 1;
 static const int g_model_color_pass_z_write = 0;
 static const int g_model_color_pass_z_func = D3DCMP_EQUAL;
+static const int g_model_alpha_test = 1;
+static const DWORD g_model_alpha_ref = 8u;
+static const DWORD g_model_alpha_func = D3DCMP_GREATER;
 static const int g_model_gouraud_shading = 1;
 static const int g_model_dither = 1;
 static const int g_model_uv_correction = 1;
@@ -207,11 +237,19 @@ static const int g_model_texture_aware_uv = 1;
 static const int g_skip_axis_tile_draws = 1;
 static const int g_min_vertex_alpha = 250;
 static const int g_reject_alpha_only_when_blending = 1;
-static const int g_reject_alpha_state_model_draws = 1;
 static const int g_diagnostics = 1;
+static const int g_transparent_model_z_test = 1;
+static const int g_transparent_model_quality_pass = 1;
+static const int g_cutout_model_alpha_test = 1;
+static const int g_cutout_model_disable_alpha_blend = 1;
+static const int g_cutout_model_two_sided = 1;
+static const int g_cutout_model_screen_expand = 1;
+static const int g_cutout_alpha_min = 224;
+static const int g_cutout_hard_alpha_low_max = 16;
+static const int g_cutout_hard_alpha_high_min = 240;
+static const DWORD g_cutout_model_alpha_ref = 16u;
 static const int g_model_lighting = 1;
 static const int g_model_lighting_translucent = 0;
-static const int g_model_geometry_stabilization = 1;
 static const int g_callsite_profiles_enabled = 1;
 static const int g_adaptive_depth_conflict_resolver = 1;
 static const int g_bad_draw_autologger = 1;
@@ -244,12 +282,7 @@ static const float g_model_lighting_depth_scale = 300.0f;
 static const float g_model_lighting_rhw_scale = 0.08f;
 static const float g_model_lighting_min_area = 0.25f;
 static const float g_model_lighting_max_luma_boost = 22.0f;
-static const float g_model_geometry_snap_xy_grid = 256.0f;
-static const float g_model_geometry_snap_z_grid = 4194304.0f;
-static const float g_model_geometry_snap_rhw_grid = 1048576.0f;
-static const float g_model_geometry_min_area = 4.0f;
-static const float g_model_geometry_max_area = 250000.0f;
-static const float g_model_geometry_max_extent = 900.0f;
+static const float g_cutout_model_screen_expand_pixels = 0.18f;
 static const float g_adaptive_depth_flat_span = 0.000080f;
 static const float g_adaptive_depth_target_span = 0.000420f;
 static const float g_adaptive_depth_max_span = 0.000900f;
@@ -272,7 +305,7 @@ static const float g_bad_draw_over_shift_abs = 0.000360f;
 
 static const ZfixCallsiteProfile g_callsite_profiles[] = {
   {
-    "re3-up-model-default",
+    "dc1-up-model-default",
     0u,
     0u,
     ZFIX_DEPTH_PROFILE_NORMAL,
@@ -335,7 +368,7 @@ static void LogLine(const char* fmt, ...)
 
 static void BuildLogPath(HINSTANCE instance)
 {
-  ZfixBuildLogPath(instance, NULL, 0, g_log_path, sizeof(g_log_path), "re3_zfix.log");
+  ZfixBuildLogPath(instance, NULL, 0, g_log_path, sizeof(g_log_path), "dc1_zfix.log");
 }
 
 static void* GetOriginal(void** vtable, int slot)
@@ -890,6 +923,71 @@ static int HasTransparentVertex(const D3D9TLVERTEX* vertices, DWORD vertex_count
   return 0;
 }
 
+static int MinVertexAlpha(const D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!vertices || vertex_count == 0)
+    return 255;
+
+  int min_alpha = 255;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    const int alpha = (int)((vertices[i].color >> 24) & 0xFFu);
+    if (alpha < min_alpha)
+      min_alpha = alpha;
+  }
+  return min_alpha;
+}
+
+static int MaxVertexAlpha(const D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!vertices || vertex_count == 0)
+    return 255;
+
+  int max_alpha = 0;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    const int alpha = (int)((vertices[i].color >> 24) & 0xFFu);
+    if (alpha > max_alpha)
+      max_alpha = alpha;
+  }
+  return max_alpha;
+}
+
+static int HasHardAlphaSpread(const D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!vertices || vertex_count == 0)
+    return 0;
+
+  int low = 0;
+  int high = 0;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    const int alpha = (int)((vertices[i].color >> 24) & 0xFFu);
+    if (alpha <= g_cutout_hard_alpha_low_max)
+      low = 1;
+    if (alpha >= g_cutout_hard_alpha_high_min)
+      high = 1;
+  }
+  return low && high;
+}
+
+static AlphaModelClass ClassifyAlphaModel(const D3D9TLVERTEX* vertices, DWORD vertex_count,
+                                          int alpha_blend_enabled, int alpha_test_enabled,
+                                          int min_alpha)
+{
+  if (!vertices || vertex_count == 0)
+    return ALPHA_MODEL_TRANSLUCENT;
+  if (g_cutout_model_alpha_test && alpha_test_enabled)
+    return ALPHA_MODEL_CUTOUT;
+  if (min_alpha >= g_cutout_alpha_min)
+    return ALPHA_MODEL_CUTOUT;
+  if (HasHardAlphaSpread(vertices, vertex_count))
+    return ALPHA_MODEL_CUTOUT;
+  if (!alpha_blend_enabled && MaxVertexAlpha(vertices, vertex_count) >= g_cutout_hard_alpha_high_min)
+    return ALPHA_MODEL_CUTOUT;
+  return ALPHA_MODEL_TRANSLUCENT;
+}
+
 static int ReadUPIndex(const void* index_data, DWORD index_format, DWORD index_offset, DWORD* out_index)
 {
   if (!index_data || !out_index)
@@ -985,6 +1083,96 @@ static int IsFlat2DLayerBounds(const DrawBounds* bounds)
   if (screen_rhw && large_2d)
     return 1;
   return 0;
+}
+
+static int IsTransparentModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type,
+                                       DWORD vertex_count, UINT primitive_count,
+                                       DrawBounds* bounds, int* min_alpha, const char** reason)
+{
+  if (reason)
+    *reason = "transparent_ok";
+  if (!g_enabled || !g_transparent_model_z_test || !vertices ||
+      vertex_count == 0 || primitive_count == 0)
+  {
+    if (reason)
+      *reason = "transparent_off";
+    return 0;
+  }
+  if (primitive_type != D3DPT_TRIANGLELIST &&
+      primitive_type != D3DPT_TRIANGLESTRIP &&
+      primitive_type != D3DPT_TRIANGLEFAN)
+  {
+    if (reason)
+      *reason = "transparent_primitive";
+    return 0;
+  }
+
+  const int local_min_alpha = MinVertexAlpha(vertices, vertex_count);
+  if (min_alpha)
+    *min_alpha = local_min_alpha;
+  if (local_min_alpha >= g_min_vertex_alpha)
+  {
+    if (reason)
+      *reason = "transparent_no_alpha";
+    return 0;
+  }
+
+  DrawBounds local_bounds;
+  ComputeDrawBounds(vertices, vertex_count, &local_bounds);
+  if (bounds)
+    *bounds = local_bounds;
+
+  if (IsAxisRectInScreenAndUV(vertices, vertex_count) && IsFlat2DLayerBounds(&local_bounds))
+  {
+    if (reason)
+      *reason = "transparent_axis";
+    return 0;
+  }
+
+  if (g_max_screen_extent > 0.0f &&
+      (local_bounds.width > g_max_screen_extent || local_bounds.height > g_max_screen_extent))
+  {
+    if (reason)
+      *reason = "transparent_large_extent";
+    return 0;
+  }
+  if (g_max_screen_area > 0.0f && local_bounds.area > g_max_screen_area)
+  {
+    if (reason)
+      *reason = "transparent_large_area";
+    return 0;
+  }
+  if (local_bounds.min_z < 0.0f || local_bounds.max_z > 1.0f)
+  {
+    if (reason)
+      *reason = "transparent_z_range";
+    return 0;
+  }
+  if (!HasModelRhwRange(&local_bounds))
+  {
+    if (reason)
+      *reason = "transparent_rhw";
+    return 0;
+  }
+  if (IsSpikeLikeTriangle(&local_bounds))
+  {
+    if (reason)
+      *reason = "transparent_spike";
+    return 0;
+  }
+
+  const float z_span = local_bounds.max_z - local_bounds.min_z;
+  const float rhw_span = local_bounds.max_rhw - local_bounds.min_rhw;
+  if (z_span < g_min_depth_variance && rhw_span < g_min_rhw_variance)
+  {
+    if (!CanResolveAdaptiveFlatDepth(NULL))
+    {
+      if (reason)
+        *reason = "transparent_flat";
+      return 0;
+    }
+  }
+  return 1;
 }
 
 static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, DWORD vertex_count,
@@ -1250,77 +1438,6 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3D9TLVERTEX* vertices, DWORD ve
   return changed;
 }
 
-static float SnapFloatGrid(float value, float grid)
-{
-  if (grid <= 0.0f)
-    return value;
-
-  const float scaled = value * grid;
-  if (scaled >= 0.0f)
-    return floorf(scaled + 0.5f) / grid;
-  return -floorf((-scaled) + 0.5f) / grid;
-}
-
-static DWORD ApplyModelGeometryStabilization(D3D9TLVERTEX* vertices, DWORD vertex_count,
-                                             const DrawBounds* bounds)
-{
-  if (!g_model_geometry_stabilization || !vertices || vertex_count == 0 || !bounds)
-    return 0;
-
-  const float width = AbsF(bounds->width);
-  const float height = AbsF(bounds->height);
-  const float extent = width > height ? width : height;
-  if (bounds->area < g_model_geometry_min_area ||
-      bounds->area > g_model_geometry_max_area ||
-      extent > g_model_geometry_max_extent)
-    return 0;
-  if (bounds->min_z < 0.0f || bounds->max_z > 1.0f || !HasModelRhwRange(bounds))
-    return 0;
-  if (IsSpikeLikeTriangle(bounds))
-    return 0;
-
-  DWORD changed_vertices = 0;
-  for (DWORD i = 0; i < vertex_count; i++)
-  {
-    D3D9TLVERTEX* v = &vertices[i];
-    const float sx = SnapFloatGrid(v->sx, g_model_geometry_snap_xy_grid);
-    const float sy = SnapFloatGrid(v->sy, g_model_geometry_snap_xy_grid);
-    const float sz = ClampDepth(SnapFloatGrid(v->sz, g_model_geometry_snap_z_grid));
-    const float rhw = SnapFloatGrid(v->rhw, g_model_geometry_snap_rhw_grid);
-    int changed = 0;
-
-    if (AbsF(sx - v->sx) > 0.0000001f)
-    {
-      v->sx = sx;
-      changed = 1;
-    }
-    if (AbsF(sy - v->sy) > 0.0000001f)
-    {
-      v->sy = sy;
-      changed = 1;
-    }
-    if (AbsF(sz - v->sz) > 0.00000001f)
-    {
-      v->sz = sz;
-      changed = 1;
-    }
-    if (AbsF(rhw - v->rhw) > 0.00000001f)
-    {
-      v->rhw = rhw;
-      changed = 1;
-    }
-    if (changed)
-      changed_vertices++;
-  }
-
-  if (!changed_vertices)
-    return 0;
-
-  InterlockedIncrement(&g_model_geometry_stabilized_draws);
-  InterlockedExchangeAdd(&g_model_geometry_stabilized_vertices, (LONG)changed_vertices);
-  return changed_vertices;
-}
-
 static float ModelLightingDepth(const D3D9TLVERTEX* v)
 {
   return v ? (v->sz + (v->rhw * g_model_lighting_rhw_scale)) : 0.0f;
@@ -1546,6 +1663,43 @@ static DWORD ApplyModelLighting(D3D9TLVERTEX* vertices, DWORD vertex_count, DWOR
   return changed;
 }
 
+static DWORD ApplyCutoutGeometryExpansion(D3D9TLVERTEX* vertices, DWORD vertex_count)
+{
+  if (!g_cutout_model_screen_expand || !vertices || vertex_count < 3 ||
+      g_cutout_model_screen_expand_pixels <= 0.0f)
+    return 0;
+
+  float center_x = 0.0f;
+  float center_y = 0.0f;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    center_x += vertices[i].sx;
+    center_y += vertices[i].sy;
+  }
+  center_x /= (float)vertex_count;
+  center_y /= (float)vertex_count;
+
+  DWORD changed = 0;
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    const float dx = vertices[i].sx - center_x;
+    const float dy = vertices[i].sy - center_y;
+    const float len = AbsF(dx) + AbsF(dy);
+    if (len <= 0.0001f)
+      continue;
+    vertices[i].sx += (dx / len) * g_cutout_model_screen_expand_pixels;
+    vertices[i].sy += (dy / len) * g_cutout_model_screen_expand_pixels;
+    changed++;
+  }
+
+  if (changed)
+  {
+    InterlockedIncrement(&g_model_cutout_expanded_draws);
+    InterlockedExchangeAdd(&g_model_cutout_expanded_vertices, (LONG)changed);
+  }
+  return changed;
+}
+
 static float AdjustModelTexCoord(float value, float snap_grid, float center_grid)
 {
   if (snap_grid <= 0.0f || center_grid <= 0.0f)
@@ -1622,9 +1776,48 @@ static void CaptureState(void* self, D3D9StateSnapshot* snapshot)
   snapshot->has_z_enable = CaptureRenderState(self, D3DRS_ZENABLE, &snapshot->z_enable);
   snapshot->has_z_write = CaptureRenderState(self, D3DRS_ZWRITEENABLE, &snapshot->z_write);
   snapshot->has_z_func = CaptureRenderState(self, D3DRS_ZFUNC, &snapshot->z_func);
+  snapshot->has_alpha_test = CaptureRenderState(self, D3DRS_ALPHATESTENABLE, &snapshot->alpha_test);
+  snapshot->has_alpha_ref = CaptureRenderState(self, D3DRS_ALPHAREF, &snapshot->alpha_ref);
+  snapshot->has_alpha_func = CaptureRenderState(self, D3DRS_ALPHAFUNC, &snapshot->alpha_func);
+  snapshot->has_alpha_blend = CaptureRenderState(self, D3DRS_ALPHABLENDENABLE, &snapshot->alpha_blend);
+  snapshot->has_src_blend = CaptureRenderState(self, D3DRS_SRCBLEND, &snapshot->src_blend);
+  snapshot->has_dest_blend = CaptureRenderState(self, D3DRS_DESTBLEND, &snapshot->dest_blend);
+  snapshot->has_cull_mode = CaptureRenderState(self, D3DRS_CULLMODE, &snapshot->cull_mode);
   snapshot->has_color_write = CaptureRenderState(self, D3DRS_COLORWRITEENABLE, &snapshot->color_write);
   snapshot->has_shade_mode = CaptureRenderState(self, D3DRS_SHADEMODE, &snapshot->shade_mode);
   snapshot->has_dither_enable = CaptureRenderState(self, D3DRS_DITHERENABLE, &snapshot->dither_enable);
+}
+
+static void ForceModelAlphaTest(void* self, const D3D9StateSnapshot* snapshot)
+{
+  if (!g_model_alpha_test || !snapshot)
+    return;
+  if (snapshot->has_alpha_test)
+    SetOneRenderState(self, D3DRS_ALPHATESTENABLE, 1);
+  if (snapshot->has_alpha_ref)
+    SetOneRenderState(self, D3DRS_ALPHAREF, g_model_alpha_ref);
+  if (snapshot->has_alpha_func)
+    SetOneRenderState(self, D3DRS_ALPHAFUNC, g_model_alpha_func);
+}
+
+static void ForceCutoutGeometryState(void* self, const D3D9StateSnapshot* snapshot)
+{
+  if (!snapshot)
+    return;
+
+  if (g_cutout_model_alpha_test)
+  {
+    if (snapshot->has_alpha_test)
+      SetOneRenderState(self, D3DRS_ALPHATESTENABLE, 1);
+    if (snapshot->has_alpha_ref)
+      SetOneRenderState(self, D3DRS_ALPHAREF, g_cutout_model_alpha_ref);
+    if (snapshot->has_alpha_func)
+      SetOneRenderState(self, D3DRS_ALPHAFUNC, g_model_alpha_func);
+  }
+  if (g_cutout_model_two_sided && snapshot->has_cull_mode)
+    SetOneRenderState(self, D3DRS_CULLMODE, D3DCULL_NONE);
+  if (g_cutout_model_disable_alpha_blend && snapshot->has_alpha_blend)
+    SetOneRenderState(self, D3DRS_ALPHABLENDENABLE, 0);
 }
 
 static void ForceModelState(void* self, const D3D9StateSnapshot* snapshot)
@@ -1635,6 +1828,23 @@ static void ForceModelState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneRenderState(self, D3DRS_ZWRITEENABLE, 1);
   if (snapshot->has_z_func)
     SetOneRenderState(self, D3DRS_ZFUNC, (DWORD)g_force_z_func);
+  ForceModelAlphaTest(self, snapshot);
+  if (g_model_gouraud_shading && snapshot->has_shade_mode)
+    SetOneRenderState(self, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
+  if (g_model_dither && snapshot->has_dither_enable)
+    SetOneRenderState(self, D3DRS_DITHERENABLE, 1);
+}
+
+static void ForceTransparentModelState(void* self, const D3D9StateSnapshot* snapshot, int write_depth)
+{
+  if (g_force_z_enable && snapshot->has_z_enable)
+    SetOneRenderState(self, D3DRS_ZENABLE, 1);
+  if (snapshot->has_z_write)
+    SetOneRenderState(self, D3DRS_ZWRITEENABLE, write_depth ? 1 : 0);
+  if (snapshot->has_z_func)
+    SetOneRenderState(self, D3DRS_ZFUNC, (DWORD)g_force_z_func);
+  if (g_cutout_model_alpha_test && write_depth)
+    ForceModelAlphaTest(self, snapshot);
   if (g_model_gouraud_shading && snapshot->has_shade_mode)
     SetOneRenderState(self, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
   if (g_model_dither && snapshot->has_dither_enable)
@@ -1651,6 +1861,20 @@ static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneRenderState(self, D3DRS_ZWRITEENABLE, snapshot->z_write);
   if (snapshot->has_z_func)
     SetOneRenderState(self, D3DRS_ZFUNC, snapshot->z_func);
+  if (snapshot->has_alpha_test)
+    SetOneRenderState(self, D3DRS_ALPHATESTENABLE, snapshot->alpha_test);
+  if (snapshot->has_alpha_ref)
+    SetOneRenderState(self, D3DRS_ALPHAREF, snapshot->alpha_ref);
+  if (snapshot->has_alpha_func)
+    SetOneRenderState(self, D3DRS_ALPHAFUNC, snapshot->alpha_func);
+  if (snapshot->has_alpha_blend)
+    SetOneRenderState(self, D3DRS_ALPHABLENDENABLE, snapshot->alpha_blend);
+  if (snapshot->has_src_blend)
+    SetOneRenderState(self, D3DRS_SRCBLEND, snapshot->src_blend);
+  if (snapshot->has_dest_blend)
+    SetOneRenderState(self, D3DRS_DESTBLEND, snapshot->dest_blend);
+  if (snapshot->has_cull_mode)
+    SetOneRenderState(self, D3DRS_CULLMODE, snapshot->cull_mode);
   if (snapshot->has_color_write)
     SetOneRenderState(self, D3DRS_COLORWRITEENABLE, snapshot->color_write);
   if (snapshot->has_shade_mode)
@@ -1659,7 +1883,7 @@ static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneRenderState(self, D3DRS_DITHERENABLE, snapshot->dither_enable);
 }
 
-static void ForceModelDepthPrepassState(void* self, const D3D9StateSnapshot* snapshot)
+static void ForceModelDepthPrepassState(void* self, const D3D9StateSnapshot* snapshot, int cutout)
 {
   if (snapshot->has_z_enable)
     SetOneRenderState(self, D3DRS_ZENABLE, 1);
@@ -1669,6 +1893,10 @@ static void ForceModelDepthPrepassState(void* self, const D3D9StateSnapshot* sna
     SetOneRenderState(self, D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
   if (snapshot->has_color_write)
     SetOneRenderState(self, D3DRS_COLORWRITEENABLE, 0);
+  if (cutout)
+    ForceCutoutGeometryState(self, snapshot);
+  else
+    ForceModelAlphaTest(self, snapshot);
   if (g_model_gouraud_shading && snapshot->has_shade_mode)
     SetOneRenderState(self, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
   if (g_model_dither && snapshot->has_dither_enable)
@@ -1676,7 +1904,7 @@ static void ForceModelDepthPrepassState(void* self, const D3D9StateSnapshot* sna
 }
 
 static void ForceModelColorPassAfterPrepassState(void* self, const D3D9StateSnapshot* snapshot,
-                                                 const ZfixCallsiteProfile* profile)
+                                                 int cutout, const ZfixCallsiteProfile* profile)
 {
   if (snapshot->has_z_enable)
     SetOneRenderState(self, D3DRS_ZENABLE, 1);
@@ -1688,6 +1916,10 @@ static void ForceModelColorPassAfterPrepassState(void* self, const D3D9StateSnap
   if (snapshot->has_color_write)
     SetOneRenderState(self, D3DRS_COLORWRITEENABLE,
                       snapshot->color_write ? snapshot->color_write : D3D_COLORWRITE_ALL);
+  if (cutout)
+    ForceCutoutGeometryState(self, snapshot);
+  else
+    ForceModelAlphaTest(self, snapshot);
   if (g_model_gouraud_shading && snapshot->has_shade_mode)
     SetOneRenderState(self, D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
   if (g_model_dither && snapshot->has_dither_enable)
@@ -1734,21 +1966,17 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
                                        profile, caller, "opaque-dpup");
   if (adaptive_changed)
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
-  const DWORD geometry_changed = ApplyModelGeometryStabilization(copy, vertex_count, &adjusted_bounds);
-  if (geometry_changed)
-    ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   LogBadDrawCandidate(caller, "opaque-dpup", 0, primitive_type, vertex_count, 0,
-                      profile, &before_bounds, &adjusted_bounds,
-                      adaptive_changed + geometry_changed);
+                      profile, &before_bounds, &adjusted_bounds, adaptive_changed);
   ApplyModelLighting(copy, vertex_count, primitive_type, NULL, 0, 0, 0);
 
   if (g_model_depth_prepass)
   {
-    ForceModelDepthPrepassState(self, &snapshot);
+    ForceModelDepthPrepassState(self, &snapshot, 0);
     const HRESULT prepass_hr = orig(self, primitive_type, primitive_count, copy, vertex_stride);
     CountModelDepthPrepass(prepass_hr);
     if (SUCCEEDED(prepass_hr))
-      ForceModelColorPassAfterPrepassState(self, &snapshot, profile);
+      ForceModelColorPassAfterPrepassState(self, &snapshot, 0, profile);
     else
       ForceModelState(self, &snapshot);
   }
@@ -1759,6 +1987,78 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   HRESULT hr = orig(self, primitive_type, primitive_count, copy, vertex_stride);
   RestoreState(self, &snapshot);
   HeapFree(GetProcessHeap(), 0, copy);
+  return hr;
+}
+
+static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrimitiveUPProc orig,
+                                                        DWORD primitive_type, UINT primitive_count,
+                                                        const void* vertex_data, UINT vertex_stride,
+                                                        DWORD vertex_count, AlphaModelClass alpha_class,
+                                                        DWORD caller)
+{
+  const ZfixCallsiteProfile* profile = NULL;
+  D3D9StateSnapshot snapshot;
+  CaptureState(self, &snapshot);
+  const int cutout = alpha_class == ALPHA_MODEL_CUTOUT;
+  if (!cutout)
+    ForceTransparentModelState(self, &snapshot, 0);
+
+  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)vertex_count;
+  D3D9TLVERTEX* copy = NULL;
+  const void* draw_vertices = vertex_data;
+
+  if (g_transparent_model_quality_pass || cutout)
+  {
+    copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (copy)
+    {
+      memcpy(copy, vertex_data, bytes);
+      DrawBounds before_bounds;
+      ComputeDrawBounds(copy, vertex_count, &before_bounds);
+      ApplyModelTexCoordCorrection(copy, vertex_count);
+      if (cutout)
+      {
+        ApplyCutoutGeometryExpansion(copy, vertex_count);
+        DrawBounds adjusted_bounds;
+        ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
+        profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
+        if (profile)
+          InterlockedIncrement(&g_callsite_profile_hits);
+        const DWORD adaptive_changed =
+          ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
+                                             profile, caller, "cutout-dpup");
+        if (adaptive_changed)
+          ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
+        LogBadDrawCandidate(caller, "cutout-dpup", 0, primitive_type, vertex_count, 0,
+                            profile, &before_bounds, &adjusted_bounds, adaptive_changed);
+      }
+      ApplyModelLighting(copy, vertex_count, primitive_type, NULL, 0, 0, !cutout);
+      draw_vertices = copy;
+    }
+  }
+  if (cutout)
+  {
+    if (g_model_depth_prepass && copy)
+    {
+      ForceModelDepthPrepassState(self, &snapshot, 1);
+      const HRESULT prepass_hr = orig(self, primitive_type, primitive_count, draw_vertices, vertex_stride);
+      CountModelDepthPrepass(prepass_hr);
+      if (SUCCEEDED(prepass_hr))
+        ForceModelColorPassAfterPrepassState(self, &snapshot, 1, profile);
+      else
+        ForceModelState(self, &snapshot);
+    }
+    else
+    {
+      ForceModelState(self, &snapshot);
+      ForceCutoutGeometryState(self, &snapshot);
+    }
+  }
+
+  HRESULT hr = orig(self, primitive_type, primitive_count, draw_vertices, vertex_stride);
+  RestoreState(self, &snapshot);
+  if (copy)
+    HeapFree(GetProcessHeap(), 0, copy);
   return hr;
 }
 
@@ -1798,25 +2098,21 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
                                        profile, caller, "opaque-dipup");
   if (adaptive_changed)
     ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
-  const DWORD geometry_changed = ApplyModelGeometryStabilization(copy, num_vertices, &adjusted_bounds);
-  if (geometry_changed)
-    ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
   LogBadDrawCandidate(caller, "opaque-dipup", 1, primitive_type, num_vertices,
                       VertexCountForPrimitive(primitive_type, primitive_count),
-                      profile, &before_bounds, &adjusted_bounds,
-                      adaptive_changed + geometry_changed);
+                      profile, &before_bounds, &adjusted_bounds, adaptive_changed);
   ApplyModelLighting(copy, num_vertices, primitive_type, index_data, index_format,
                      VertexCountForPrimitive(primitive_type, primitive_count), 0);
 
   if (g_model_depth_prepass)
   {
-    ForceModelDepthPrepassState(self, &snapshot);
+    ForceModelDepthPrepassState(self, &snapshot, 0);
     const HRESULT prepass_hr =
       orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
            index_data, index_format, copy, vertex_stride);
     CountModelDepthPrepass(prepass_hr);
     if (SUCCEEDED(prepass_hr))
-      ForceModelColorPassAfterPrepassState(self, &snapshot, profile);
+      ForceModelColorPassAfterPrepassState(self, &snapshot, 0, profile);
     else
       ForceModelState(self, &snapshot);
   }
@@ -1828,6 +2124,84 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
                     index_data, index_format, copy, vertex_stride);
   RestoreState(self, &snapshot);
   HeapFree(GetProcessHeap(), 0, copy);
+  return hr;
+}
+
+static HRESULT DrawIndexedPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawIndexedPrimitiveUPProc orig,
+                                                              DWORD primitive_type, UINT min_vertex_index,
+                                                              UINT num_vertices, UINT primitive_count,
+                                                              const void* index_data, DWORD index_format,
+                                                              const void* vertex_data, UINT vertex_stride,
+                                                              AlphaModelClass alpha_class, DWORD caller)
+{
+  const ZfixCallsiteProfile* profile = NULL;
+  D3D9StateSnapshot snapshot;
+  CaptureState(self, &snapshot);
+  const int cutout = alpha_class == ALPHA_MODEL_CUTOUT;
+  if (!cutout)
+    ForceTransparentModelState(self, &snapshot, 0);
+
+  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)num_vertices;
+  D3D9TLVERTEX* copy = NULL;
+  const void* draw_vertices = vertex_data;
+
+  if (g_transparent_model_quality_pass || cutout)
+  {
+    copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+    if (copy)
+    {
+      memcpy(copy, vertex_data, bytes);
+      DrawBounds before_bounds;
+      ComputeDrawBounds(copy, num_vertices, &before_bounds);
+      ApplyModelTexCoordCorrection(copy, num_vertices);
+      if (cutout)
+      {
+        ApplyCutoutGeometryExpansion(copy, num_vertices);
+        DrawBounds adjusted_bounds;
+        ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
+        profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
+        if (profile)
+          InterlockedIncrement(&g_callsite_profile_hits);
+        const DWORD adaptive_changed =
+          ApplyAdaptiveDepthConflictResolver(copy, num_vertices, &adjusted_bounds,
+                                             profile, caller, "cutout-dipup");
+        if (adaptive_changed)
+          ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
+        LogBadDrawCandidate(caller, "cutout-dipup", 1, primitive_type, num_vertices,
+                            VertexCountForPrimitive(primitive_type, primitive_count),
+                            profile, &before_bounds, &adjusted_bounds, adaptive_changed);
+      }
+      ApplyModelLighting(copy, num_vertices, primitive_type, index_data, index_format,
+                         VertexCountForPrimitive(primitive_type, primitive_count), !cutout);
+      draw_vertices = copy;
+    }
+  }
+  if (cutout)
+  {
+    if (g_model_depth_prepass && copy)
+    {
+      ForceModelDepthPrepassState(self, &snapshot, 1);
+      const HRESULT prepass_hr =
+        orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
+             index_data, index_format, draw_vertices, vertex_stride);
+      CountModelDepthPrepass(prepass_hr);
+      if (SUCCEEDED(prepass_hr))
+        ForceModelColorPassAfterPrepassState(self, &snapshot, 1, profile);
+      else
+        ForceModelState(self, &snapshot);
+    }
+    else
+    {
+      ForceModelState(self, &snapshot);
+      ForceCutoutGeometryState(self, &snapshot);
+    }
+  }
+
+  HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
+                    index_data, index_format, draw_vertices, vertex_stride);
+  RestoreState(self, &snapshot);
+  if (copy)
+    HeapFree(GetProcessHeap(), 0, copy);
   return hr;
 }
 
@@ -1861,16 +2235,31 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
   DWORD alpha_test = 0;
   const int alpha_test_enabled =
     CaptureRenderState(self, D3DRS_ALPHATESTENABLE, &alpha_test) && alpha_test != 0;
-  if (g_reject_alpha_state_model_draws && (alpha_blend_enabled || alpha_test_enabled))
-  {
-    InterlockedIncrement(&g_dpup_alpha_rejected);
-    return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
-  }
-
   const char* reason = NULL;
   if (!IsModelDepthDraw((const D3D9TLVERTEX*)vertex_data, primitive_type, vertex_count, primitive_count,
                         alpha_blend_enabled, &bounds, &reason))
   {
+    DrawBounds transparent_bounds;
+    int min_alpha = 255;
+    const char* transparent_reason = NULL;
+    if (reason && strcmp(reason, "alpha") == 0 &&
+        IsTransparentModelDepthDraw((const D3D9TLVERTEX*)vertex_data, primitive_type, vertex_count,
+                                    primitive_count, &transparent_bounds, &min_alpha,
+                                    &transparent_reason))
+    {
+      (void)transparent_reason;
+      const AlphaModelClass alpha_class =
+        ClassifyAlphaModel((const D3D9TLVERTEX*)vertex_data, vertex_count,
+                           alpha_blend_enabled, alpha_test_enabled, min_alpha);
+      if (alpha_class == ALPHA_MODEL_CUTOUT)
+        InterlockedIncrement(&g_dpup_cutout_accepted);
+      else
+        InterlockedIncrement(&g_dpup_transparent_accepted);
+      return DrawPrimitiveUPWithTransparentModelDepth(self, orig, primitive_type, primitive_count,
+                                                     vertex_data, vertex_stride, vertex_count,
+                                                     alpha_class, caller);
+    }
+
     if (reason && strcmp(reason, "alpha") == 0)
       InterlockedIncrement(&g_dpup_alpha_rejected);
     else if (reason && strcmp(reason, "axis") == 0)
@@ -1978,18 +2367,32 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   DWORD alpha_test = 0;
   const int alpha_test_enabled =
     CaptureRenderState(self, D3DRS_ALPHATESTENABLE, &alpha_test) && alpha_test != 0;
-  if (g_reject_alpha_state_model_draws && (alpha_blend_enabled || alpha_test_enabled))
-  {
-    InterlockedIncrement(&g_dipup_rejected);
-    HeapFree(GetProcessHeap(), 0, indexed);
-    return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
-                index_data, index_format, vertex_data, vertex_stride);
-  }
-
   const char* reason = NULL;
   if (!IsModelDepthDraw(indexed, primitive_type, index_count, primitive_count,
                         alpha_blend_enabled, &bounds, &reason))
   {
+    DrawBounds transparent_bounds;
+    int min_alpha = 255;
+    const char* transparent_reason = NULL;
+    if (reason && strcmp(reason, "alpha") == 0 &&
+        IsTransparentModelDepthDraw(indexed, primitive_type, index_count, primitive_count,
+                                    &transparent_bounds, &min_alpha, &transparent_reason))
+    {
+      (void)transparent_reason;
+      const AlphaModelClass alpha_class =
+        ClassifyAlphaModel(indexed, index_count, alpha_blend_enabled,
+                           alpha_test_enabled, min_alpha);
+      if (alpha_class == ALPHA_MODEL_CUTOUT)
+        InterlockedIncrement(&g_dipup_cutout_accepted);
+      else
+        InterlockedIncrement(&g_dpup_transparent_accepted);
+      HeapFree(GetProcessHeap(), 0, indexed);
+      return DrawIndexedPrimitiveUPWithTransparentModelDepth(self, orig, primitive_type,
+                                                            min_vertex_index, num_vertices,
+                                                            primitive_count, index_data,
+                                                            index_format, vertex_data,
+                                                            vertex_stride, alpha_class, caller);
+    }
     InterlockedIncrement(&g_dipup_rejected);
     HeapFree(GetProcessHeap(), 0, indexed);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
@@ -2051,20 +2454,21 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
   if (frame <= g_initial_frame_summaries ||
       (g_frame_summary_interval > 0 && (frame % g_frame_summary_interval) == 0))
   {
-    LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld "
+    LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld transparent=%ld cutout=%ld/%ld "
             "dipup=%ld dipupAccepted=%ld dipupRejected=%ld depthPrepass=%ld/%ld depthClear=%ld depthFail=%ld "
-            "uvDraws=%ld uvCoords=%ld light=%ld/%ld "
-            "geomStable=%ld/%ld profiles=%ld adaptive=%ld/%ld badDraw=%ld/%ld/%ld "
+            "uvDraws=%ld uvCoords=%ld light=%ld/%ld cutoutExpand=%ld/%ld "
+            "profiles=%ld adaptive=%ld/%ld badDraw=%ld/%ld/%ld "
             "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
             "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p wh=%ux%u curFVF=0x%lX "
             "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
             frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
+            g_dpup_transparent_accepted, g_dpup_cutout_accepted, g_dipup_cutout_accepted,
             g_dipup_total, g_dipup_accepted,
             g_dipup_rejected, g_model_depth_prepass_draws, g_model_depth_prepass_failures,
             g_depth_clear_count, g_depth_clear_failures,
             g_model_uv_corrected_draws, g_model_uv_corrected_coords,
             g_model_lighting_draws, g_model_lighting_vertices,
-            g_model_geometry_stabilized_draws, g_model_geometry_stabilized_vertices,
+            g_model_cutout_expanded_draws, g_model_cutout_expanded_vertices,
             g_callsite_profile_hits, g_adaptive_depth_draws, g_adaptive_depth_vertices,
             g_bad_draw_seen, g_bad_draw_logged, g_bad_draw_written,
             g_dpup_stride_rejected, g_dpup_alpha_rejected, g_dpup_axis_rejected,
@@ -2211,10 +2615,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     BuildLogPath(instance);
     DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
-    LogLine("re3_zfix loaded");
-    LogLine("depth prepass=%d colorZWrite=%d colorZFunc=%d",
+    LogLine("dc1_zfix loaded");
+    LogLine("depth prepass=%d colorZWrite=%d colorZFunc=%d alphaTest=%d alphaRef=%lu alphaFunc=%lu",
             g_model_depth_prepass, g_model_color_pass_z_write,
-            g_model_color_pass_z_func);
+            g_model_color_pass_z_func, g_model_alpha_test,
+            g_model_alpha_ref, g_model_alpha_func);
     LogLine("profiles enabled=%d count=%lu adaptiveDepth=%d flatSpan=%.8f targetSpan=%.8f "
             "maxSpan=%.8f maxShift=%.8f area=%.1f..%.1f extent=%.1f..%.1f "
             "small=%.1f/%.1f strength=%.2f",
@@ -2230,13 +2635,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_bad_draw_tiny_z_span,
             g_bad_draw_tiny_area, g_bad_draw_over_span_ratio,
             g_bad_draw_over_shift_abs);
-    LogLine("alpha bypass stateReject=%d textureAwareUV=%d",
-            g_reject_alpha_state_model_draws, g_model_texture_aware_uv);
-    LogLine("geometry_stabilization enabled=%d xyGrid=%.1f zGrid=%.1f rhwGrid=%.1f area=%.1f..%.1f extent<=%.1f",
-            g_model_geometry_stabilization, g_model_geometry_snap_xy_grid,
-            g_model_geometry_snap_z_grid, g_model_geometry_snap_rhw_grid,
-            g_model_geometry_min_area, g_model_geometry_max_area,
-            g_model_geometry_max_extent);
+    LogLine("alpha classify cutoutMin=%d hardAlpha=%d/%d textureAwareUV=%d twoSided=%d alphaRef=%lu expand=%d/%.2f",
+            g_cutout_alpha_min, g_cutout_hard_alpha_low_max,
+            g_cutout_hard_alpha_high_min, g_model_texture_aware_uv,
+            g_cutout_model_two_sided, g_cutout_model_alpha_ref,
+            g_cutout_model_screen_expand, g_cutout_model_screen_expand_pixels);
     LogLine("model_lighting enabled=%d translucent=%d floor=%.1f lift=%.3f gain=%.3f sat=%.3f direct=%.3f rim=%.3f luma=%.1f/%.1f maxBoost=%.1f",
             g_model_lighting, g_model_lighting_translucent,
             g_model_lighting_ambient_floor, g_model_lighting_shadow_lift,

@@ -1,9 +1,19 @@
 param(
-  [ValidateSet('all', 're2', 're3')]
+  [ValidateSet('all', 're1', 're2', 're3', 'dc1')]
   [string]$Target = 'all'
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 3.0
+
+$BuildTargets = @{
+  re2 = 're2_zfix'
+  re1 = 're1_zfix'
+  re3 = 're3_zfix'
+  dc1 = 'dc1_zfix'
+}
+
+$DefaultTargetOrder = @('re2', 're1', 're3', 'dc1')
 
 $zig = $env:ZIG
 if (-not $zig) {
@@ -33,9 +43,7 @@ function Build-Asi {
   Get-Item $out
 }
 
-if ($Target -eq 'all' -or $Target -eq 're2') {
-  Build-Asi 're2_zfix'
-}
-if ($Target -eq 'all' -or $Target -eq 're3') {
-  Build-Asi 're3_zfix'
+$targetsToBuild = if ($Target -eq 'all') { $DefaultTargetOrder } else { @($Target) }
+foreach ($targetName in $targetsToBuild) {
+  Build-Asi $BuildTargets[$targetName]
 }
