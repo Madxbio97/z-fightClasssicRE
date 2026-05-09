@@ -129,10 +129,6 @@ typedef HRESULT(STDMETHODCALLTYPE* DirectDrawCreateSurfaceProc)(void* self, DDSU
                                                                 void** surface, void* outer);
 typedef HRESULT(STDMETHODCALLTYPE* DirectDrawSetDisplayModeProc)(void* self, DWORD width,
                                                                  DWORD height, DWORD bpp);
-typedef HRESULT(STDMETHODCALLTYPE* DirectDraw2SetDisplayModeProc)(void* self, DWORD width,
-                                                                  DWORD height, DWORD bpp,
-                                                                  DWORD refresh_rate,
-                                                                  DWORD flags);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltProc)(void* self, RECT* dst, void* src, RECT* src_rect,
                                                      DWORD flags, void* fx);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltFastProc)(void* self, DWORD x, DWORD y, void* src,
@@ -193,9 +189,6 @@ static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC
                                                        void** surface, void* outer);
 static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width, DWORD height,
                                                         DWORD bpp);
-static HRESULT STDMETHODCALLTYPE Hook_DD2_SetDisplayMode(void* self, DWORD width, DWORD height,
-                                                         DWORD bpp, DWORD refresh_rate,
-                                                         DWORD flags);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Blt(void* self, RECT* dst, void* src, RECT* src_rect,
                                                     DWORD flags, void* fx);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_BltFast(void* self, DWORD x, DWORD y, void* src,
@@ -875,14 +868,6 @@ static int ResolveDisclaimerSurfaceSize(HDC dc, const DDSURFACEDESC_COMPAT* desc
     height = GetDeviceCaps(dc, VERTRES);
   }
 
-  const LONG mode_w = g_display_mode_width;
-  const LONG mode_h = g_display_mode_height;
-  if (ValidDisplayExtent((DWORD)mode_w, (DWORD)mode_h))
-  {
-    width = (int)mode_w;
-    height = (int)mode_h;
-  }
-
   RECT clip;
   memset(&clip, 0, sizeof(clip));
   const int clip_type = GetClipBox(dc, &clip);
@@ -890,12 +875,8 @@ static int ResolveDisclaimerSurfaceSize(HDC dc, const DDSURFACEDESC_COMPAT* desc
   const int clip_h = RectHeight(&clip);
   if (clip_type != ERROR && ValidDisplayExtent((DWORD)clip_w, (DWORD)clip_h))
   {
-    const int mode_valid = ValidDisplayExtent((DWORD)mode_w, (DWORD)mode_h);
-    if (!mode_valid || ((int64_t)clip_w * clip_h) > ((int64_t)width * height))
-    {
-      width = clip_w;
-      height = clip_h;
-    }
+    width = clip_w;
+    height = clip_h;
   }
 
   if (!ValidDisplayExtent((DWORD)width, (DWORD)height))
@@ -1241,21 +1222,6 @@ static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width,
   return hr;
 }
 
-static HRESULT STDMETHODCALLTYPE Hook_DD2_SetDisplayMode(void* self, DWORD width, DWORD height,
-                                                         DWORD bpp, DWORD refresh_rate,
-                                                         DWORD flags)
-{
-  DirectDraw2SetDisplayModeProc orig =
-    (DirectDraw2SetDisplayModeProc)GetOriginal(*(void***)self, 21);
-  if (!orig)
-    return E_FAIL;
-
-  HRESULT hr = orig(self, width, height, bpp, refresh_rate, flags);
-  if (SUCCEEDED(hr))
-    RememberDisplayMode(width, height, bpp, "SetDisplayMode");
-  return hr;
-}
-
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj)
 {
   QueryInterfaceProc orig = (QueryInterfaceProc)GetOriginal(*(void***)self, 0);
@@ -1267,10 +1233,7 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
   {
     PatchVTableSlot(*ppvObj, 0, (void*)Hook_QueryInterface);
     if (IsGuid(riid, &kIID_IDirectDraw2))
-    {
       PatchVTableSlot(*ppvObj, 6, (void*)Hook_DD_CreateSurface);
-      PatchVTableSlot(*ppvObj, 21, (void*)Hook_DD2_SetDisplayMode);
-    }
   }
 
   return hr;
