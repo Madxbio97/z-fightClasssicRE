@@ -127,15 +127,11 @@ typedef struct StartupDisclaimerFrameBuffer {
 typedef HRESULT(WINAPI* DirectDrawCreateProc)(GUID* lpGUID, void** lplpDD, void* pUnkOuter);
 typedef HRESULT(STDMETHODCALLTYPE* DirectDrawCreateSurfaceProc)(void* self, DDSURFACEDESC_COMPAT* desc,
                                                                 void** surface, void* outer);
-typedef HRESULT(STDMETHODCALLTYPE* DirectDrawSetDisplayModeProc)(void* self, DWORD width,
-                                                                 DWORD height, DWORD bpp);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltProc)(void* self, RECT* dst, void* src, RECT* src_rect,
                                                      DWORD flags, void* fx);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltFastProc)(void* self, DWORD x, DWORD y, void* src,
                                                          RECT* src_rect, DWORD trans);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceFlipProc)(void* self, void* target_override, DWORD flags);
-typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceGetDCProc)(void* self, HDC* dc);
-typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceReleaseDCProc)(void* self, HDC dc);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceGetSurfaceDescProc)(void* self, DDSURFACEDESC_COMPAT* desc);
 typedef HRESULT(STDMETHODCALLTYPE* QueryInterfaceProc)(void* self, REFIID riid, void** ppvObj);
 typedef uint8_t* (*WebPDecodeBGRAProc)(const uint8_t* data, size_t data_size, int* width, int* height);
@@ -153,6 +149,7 @@ static DirectDrawCreateProc g_real_direct_draw_create = NULL;
 static char g_game_dir[MAX_PATH];
 static char g_log_path[MAX_PATH];
 static int g_log_enabled = 0;
+static HWND g_game_window = NULL;
 
 static StartupDisclaimerImage g_image;
 static StartupDisclaimerFrameBuffer g_frame;
@@ -174,21 +171,19 @@ static volatile LONG g_action_key_count = 0;
 static volatile LONG g_action_button_count = 0;
 static volatile LONG g_surface_seen = 0;
 static volatile LONG g_surface_patched = 0;
-static volatile LONG g_display_mode_changes = 0;
-static volatile LONG g_display_mode_width = 0;
-static volatile LONG g_display_mode_height = 0;
-static volatile LONG g_display_mode_bpp = 0;
 static volatile LONG g_draws = 0;
 static volatile LONG g_presents = 0;
 static volatile LONG g_hold_done = 0;
 static volatile LONG g_retired = 0;
 static volatile LONG g_draw_logged = 0;
 static volatile LONG g_failure_logged = 0;
+static volatile LONG g_window_logged = 0;
+static volatile LONG g_window_width = 0;
+static volatile LONG g_window_height = 0;
+static volatile LONG g_layout_changes = 0;
 
 static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC_COMPAT* desc,
                                                        void** surface, void* outer);
-static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width, DWORD height,
-                                                        DWORD bpp);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Blt(void* self, RECT* dst, void* src, RECT* src_rect,
                                                     DWORD flags, void* fx);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_BltFast(void* self, DWORD x, DWORD y, void* src,
@@ -197,7 +192,7 @@ static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Flip(void* self, void* target_ov
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj);
 static void ReleaseFrameBuffer(void);
 static void LogLine(const char* fmt, ...);
-static int DrawDisclaimer(void* surface, const char* reason, int present_event);
+static int DrawDisclaimer(void* surface, int present_event);
 
 static void* GetOriginal(void** vtable, int slot)
 {
@@ -215,23 +210,10 @@ static int ValidDisplayExtent(DWORD width, DWORD height)
   return width > 0 && height > 0 && width <= 8192 && height <= 8192;
 }
 
-static void RememberDisplayMode(DWORD width, DWORD height, DWORD bpp,
-                                const char* reason)
+static void MarkLayoutChange(void)
 {
-  if (!ValidDisplayExtent(width, height))
-    return;
-
-  const LONG old_w = InterlockedExchange(&g_display_mode_width, (LONG)width);
-  const LONG old_h = InterlockedExchange(&g_display_mode_height, (LONG)height);
-  InterlockedExchange(&g_display_mode_bpp, (LONG)bpp);
-  const LONG changes = InterlockedIncrement(&g_display_mode_changes);
-
-  if (old_w != (LONG)width || old_h != (LONG)height)
-  {
-    ReleaseFrameBuffer();
-    LogLine("startup disclaimer display mode #%ld via=%s wh=%lux%lu bpp=%lu old=%ldx%ld",
-            changes, reason ? reason : "unknown", width, height, bpp, old_w, old_h);
-  }
+  ReleaseFrameBuffer();
+  InterlockedIncrement(&g_layout_changes);
 }
 
 static void BuildLogPath(HINSTANCE instance)
@@ -854,36 +836,233 @@ static int RectHeight(const RECT* rect)
   return rect ? (int)(rect->bottom - rect->top) : 0;
 }
 
-static int ResolveDisclaimerSurfaceSize(HDC dc, const DDSURFACEDESC_COMPAT* desc,
-                                        int* out_width, int* out_height)
+static int DrawDisclaimerGdiToDC(HDC dc, const BYTE* pixels, int image_w,
+                                 int image_h, int surface_w, int surface_h,
+                                 int* out_dst_w, int* out_dst_h,
+                                 int* out_dst_x, int* out_dst_y)
 {
-  if (!dc || !desc || !out_width || !out_height)
+  if (!dc || !pixels || image_w <= 0 || image_h <= 0 ||
+      !ValidDisplayExtent((DWORD)surface_w, (DWORD)surface_h))
     return 0;
 
-  int width = (int)desc->dwWidth;
-  int height = (int)desc->dwHeight;
-  if (!ValidDisplayExtent((DWORD)width, (DWORD)height))
+  int dst_w = surface_w;
+  int dst_h = (int)(((int64_t)surface_w * image_h) / image_w);
+  if (dst_h > surface_h)
   {
-    width = GetDeviceCaps(dc, HORZRES);
-    height = GetDeviceCaps(dc, VERTRES);
+    dst_h = surface_h;
+    dst_w = (int)(((int64_t)surface_h * image_w) / image_h);
   }
-
-  RECT clip;
-  memset(&clip, 0, sizeof(clip));
-  const int clip_type = GetClipBox(dc, &clip);
-  const int clip_w = RectWidth(&clip);
-  const int clip_h = RectHeight(&clip);
-  if (clip_type != ERROR && ValidDisplayExtent((DWORD)clip_w, (DWORD)clip_h))
-  {
-    width = clip_w;
-    height = clip_h;
-  }
-
-  if (!ValidDisplayExtent((DWORD)width, (DWORD)height))
+  if (dst_w <= 0 || dst_h <= 0 || !EnsureFrameBuffer(dc, surface_w, surface_h))
     return 0;
 
-  *out_width = width;
-  *out_height = height;
+  const int dst_x = (surface_w - dst_w) / 2;
+  const int dst_y = (surface_h - dst_h) / 2;
+
+  BITMAPINFO bmi;
+  memset(&bmi, 0, sizeof(bmi));
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth = image_w;
+  bmi.bmiHeader.biHeight = -image_h;
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+
+  SetStretchBltMode(g_frame.dc, COLORONCOLOR);
+  SetBrushOrgEx(g_frame.dc, 0, 0, NULL);
+  PatBlt(g_frame.dc, 0, 0, surface_w, surface_h, BLACKNESS);
+  const int stretch = StretchDIBits(g_frame.dc, dst_x, dst_y, dst_w, dst_h,
+                                    0, 0, image_w, image_h,
+                                    pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
+  if (stretch == 0 || stretch == (int)GDI_ERROR)
+  {
+    if (InterlockedIncrement(&g_failure_logged) <= 4)
+      LogLine("startup disclaimer draw failed: StretchDIBits result=%d", stretch);
+    return 0;
+  }
+
+  if (!BitBlt(dc, 0, 0, surface_w, surface_h, g_frame.dc, 0, 0, SRCCOPY))
+  {
+    if (InterlockedIncrement(&g_failure_logged) <= 4)
+      LogLine("startup disclaimer draw failed: BitBlt gle=%lu", GetLastError());
+    return 0;
+  }
+
+  if (out_dst_w)
+    *out_dst_w = dst_w;
+  if (out_dst_h)
+    *out_dst_h = dst_h;
+  if (out_dst_x)
+    *out_dst_x = dst_x;
+  if (out_dst_y)
+    *out_dst_y = dst_y;
+  return 1;
+}
+
+typedef struct WindowSearch {
+  DWORD pid;
+  HWND best;
+  int best_width;
+  int best_height;
+  int best_area;
+} WindowSearch;
+
+static int ResolveWindowClient(HWND hwnd, int* out_width, int* out_height)
+{
+  if (!hwnd || !IsWindow(hwnd) || !IsWindowVisible(hwnd) ||
+      GetAncestor(hwnd, GA_ROOT) != hwnd)
+    return 0;
+
+  RECT client;
+  memset(&client, 0, sizeof(client));
+  if (!GetClientRect(hwnd, &client))
+    return 0;
+
+  const int width = RectWidth(&client);
+  const int height = RectHeight(&client);
+  if (!ValidDisplayExtent((DWORD)width, (DWORD)height) ||
+      width < 64 || height < 64)
+    return 0;
+
+  if (out_width)
+    *out_width = width;
+  if (out_height)
+    *out_height = height;
+  return 1;
+}
+
+static BOOL CALLBACK EnumProcessWindowsProc(HWND hwnd, LPARAM param)
+{
+  int width = 0;
+  int height = 0;
+  WindowSearch* search = (WindowSearch*)param;
+  if (!search || !ResolveWindowClient(hwnd, &width, &height))
+    return TRUE;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid != search->pid)
+    return TRUE;
+
+  const int area = width * height;
+  if (area > search->best_area)
+  {
+    search->best = hwnd;
+    search->best_width = width;
+    search->best_height = height;
+    search->best_area = area;
+  }
+
+  return TRUE;
+}
+
+static void RememberWindow(HWND hwnd, int width, int height, const char* reason)
+{
+  if (!hwnd || !ValidDisplayExtent((DWORD)width, (DWORD)height))
+    return;
+
+  const HWND old_hwnd = g_game_window;
+  const LONG old_w = g_window_width;
+  const LONG old_h = g_window_height;
+  if (old_hwnd == hwnd && old_w == (LONG)width && old_h == (LONG)height)
+    return;
+
+  InterlockedExchange(&g_window_width, (LONG)width);
+  InterlockedExchange(&g_window_height, (LONG)height);
+  g_game_window = hwnd;
+
+  MarkLayoutChange();
+  const LONG changes = g_layout_changes;
+  char title[128];
+  title[0] = '\0';
+  GetWindowTextA(hwnd, title, (int)sizeof(title));
+  LogLine("startup disclaimer window #%ld layout=%ld via=%s hwnd=%p client=%dx%d old=%p/%ldx%ld title=%s",
+          InterlockedIncrement(&g_window_logged), changes,
+          reason ? reason : "unknown", hwnd, width, height,
+          old_hwnd, old_w, old_h, title);
+}
+
+static HWND ResolveGameWindow(int* out_width, int* out_height)
+{
+  const DWORD pid = GetCurrentProcessId();
+  HWND foreground = GetForegroundWindow();
+  DWORD window_pid = 0;
+  if (foreground)
+    GetWindowThreadProcessId(foreground, &window_pid);
+  if (window_pid == pid)
+  {
+    int width = 0;
+    int height = 0;
+    if (ResolveWindowClient(foreground, &width, &height))
+    {
+      RememberWindow(foreground, width, height, "foreground");
+      if (out_width)
+        *out_width = width;
+      if (out_height)
+        *out_height = height;
+      return foreground;
+    }
+  }
+
+  HWND hwnd = g_game_window;
+  int width = 0;
+  int height = 0;
+  if (ResolveWindowClient(hwnd, &width, &height))
+  {
+    RememberWindow(hwnd, width, height, "cached");
+    if (out_width)
+      *out_width = width;
+    if (out_height)
+      *out_height = height;
+    return hwnd;
+  }
+
+  WindowSearch search;
+  memset(&search, 0, sizeof(search));
+  search.pid = pid;
+  EnumWindows(EnumProcessWindowsProc, (LPARAM)&search);
+  if (search.best)
+  {
+    RememberWindow(search.best, search.best_width, search.best_height, "enum");
+    if (out_width)
+      *out_width = search.best_width;
+    if (out_height)
+      *out_height = search.best_height;
+    return search.best;
+  }
+
+  return NULL;
+}
+
+static int DrawDisclaimerWindow(const BYTE* pixels, int image_w, int image_h,
+                                int* out_surface_w, int* out_surface_h,
+                                int* out_dst_w, int* out_dst_h,
+                                int* out_dst_x, int* out_dst_y,
+                                int* out_bpp)
+{
+  int surface_w = 0;
+  int surface_h = 0;
+  HWND hwnd = ResolveGameWindow(&surface_w, &surface_h);
+  if (!hwnd)
+    return 0;
+
+  HDC dc = GetDC(hwnd);
+  if (!dc)
+    return 0;
+
+  const int bpp = GetDeviceCaps(dc, BITSPIXEL) * GetDeviceCaps(dc, PLANES);
+  const int ok = DrawDisclaimerGdiToDC(dc, pixels, image_w, image_h,
+                                       surface_w, surface_h, out_dst_w,
+                                       out_dst_h, out_dst_x, out_dst_y);
+  ReleaseDC(hwnd, dc);
+  if (!ok)
+    return 0;
+
+  if (out_surface_w)
+    *out_surface_w = surface_w;
+  if (out_surface_h)
+    *out_surface_h = surface_h;
+  if (out_bpp)
+    *out_bpp = bpp;
   return 1;
 }
 
@@ -961,26 +1140,19 @@ static const BYTE* PixelsForAlpha(BYTE alpha)
 
 static void HoldAfterPresent(void* surface, DWORD elapsed_ms)
 {
+  (void)surface;
+  (void)elapsed_ms;
   if (InterlockedCompareExchange(&g_hold_done, 1, 0) != 0)
     return;
-  if (elapsed_ms >= STARTUP_DISCLAIMER_DURATION_MS)
+
+  if (!EnsureImage())
     return;
 
-  const DWORD hold_ms = STARTUP_DISCLAIMER_DURATION_MS - elapsed_ms;
-  const DWORD start = GetTickCount();
-  LogLine("startup disclaimer hold begin remaining=%lums", hold_ms);
-
+  LogLine("startup disclaimer hold begin");
   for (;;)
   {
-    const DWORD now = GetTickCount();
-    const DWORD held = (DWORD)(now - start);
-    if (held >= hold_ms || g_retired)
+    if (g_retired)
       break;
-    if (SkipPressed())
-    {
-      RetireDisclaimer("skip", held + elapsed_ms);
-      break;
-    }
 
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE))
@@ -989,9 +1161,44 @@ static void HoldAfterPresent(void* surface, DWORD elapsed_ms)
       DispatchMessageA(&msg);
     }
 
-    DrawDisclaimer(surface, "HoldFade", 0);
+    const DWORD now = GetTickCount();
+    if (!g_start_tick)
+      g_start_tick = now ? now : 1u;
 
-    DWORD left = hold_ms - held;
+    const DWORD elapsed = (DWORD)(now - g_start_tick);
+    if (elapsed >= STARTUP_DISCLAIMER_DURATION_MS)
+      break;
+    if (SkipPressed())
+    {
+      RetireDisclaimer("skip", elapsed);
+      return;
+    }
+
+    const BYTE alpha = FadeAlpha(elapsed);
+    const BYTE* pixels = PixelsForAlpha(alpha);
+    int surface_w = 0;
+    int surface_h = 0;
+    int dst_w = 0;
+    int dst_h = 0;
+    int dst_x = 0;
+    int dst_y = 0;
+    int bpp = 0;
+    if (DrawDisclaimerWindow(pixels, g_image.width, g_image.height,
+                             &surface_w, &surface_h, &dst_w, &dst_h,
+                             &dst_x, &dst_y, &bpp))
+    {
+      const LONG draws = InterlockedIncrement(&g_draws);
+      const LONG presents = InterlockedIncrement(&g_presents);
+      if (InterlockedIncrement(&g_draw_logged) <= 8)
+      {
+        LogLine("startup disclaimer draw #%ld present=%ld alpha=%u via=Hold path=window "
+                "surface=%dx%d dst=%dx%d+%d+%d bpp=%d",
+                draws, presents, (unsigned)alpha, surface_w, surface_h,
+                dst_w, dst_h, dst_x, dst_y, bpp);
+      }
+    }
+
+    DWORD left = STARTUP_DISCLAIMER_DURATION_MS - elapsed;
     if (left > STARTUP_DISCLAIMER_FRAME_SLEEP_MS)
       left = STARTUP_DISCLAIMER_FRAME_SLEEP_MS;
     Sleep(left ? left : 1u);
@@ -1000,16 +1207,14 @@ static void HoldAfterPresent(void* surface, DWORD elapsed_ms)
   RetireDisclaimer("hold-complete", STARTUP_DISCLAIMER_DURATION_MS);
 }
 
-static int DrawDisclaimer(void* surface, const char* reason, int present_event)
+static int DrawDisclaimer(void* surface, int present_event)
 {
   if (!surface || g_retired)
     return 0;
 
   DDSurfaceGetSurfaceDescProc get_desc =
     (DDSurfaceGetSurfaceDescProc)GetVTableSlot(surface, 22);
-  DDSurfaceGetDCProc get_dc = (DDSurfaceGetDCProc)GetVTableSlot(surface, 17);
-  DDSurfaceReleaseDCProc release_dc = (DDSurfaceReleaseDCProc)GetVTableSlot(surface, 26);
-  if (!get_desc || !get_dc || !release_dc)
+  if (!get_desc)
     return 0;
 
   DDSURFACEDESC_COMPAT desc;
@@ -1018,16 +1223,27 @@ static int DrawDisclaimer(void* surface, const char* reason, int present_event)
   if (FAILED(get_desc(surface, &desc)) || !IsDisclaimerSurfaceDesc(&desc))
     return 0;
 
-  if (!EnsureImage())
+  const int effective_present =
+    present_event || ((desc.ddsCaps.dwCaps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER)) != 0);
+  if (!effective_present)
     return 0;
+  int unused_w = 0;
+  int unused_h = 0;
+  ResolveGameWindow(&unused_w, &unused_h);
 
   const DWORD now = GetTickCount();
   if (!g_start_tick)
     g_start_tick = now ? now : 1u;
+
   const DWORD elapsed = (DWORD)(now - g_start_tick);
   if (elapsed > STARTUP_DISCLAIMER_DURATION_MS)
   {
     RetireDisclaimer("timer", elapsed);
+    return 0;
+  }
+  if (SkipPressed())
+  {
+    RetireDisclaimer("skip", elapsed);
     return 0;
   }
   if (g_draws >= STARTUP_DISCLAIMER_MAX_DRAWS ||
@@ -1037,89 +1253,21 @@ static int DrawDisclaimer(void* surface, const char* reason, int present_event)
     return 0;
   }
 
-  HDC dc = NULL;
-  HRESULT hr = get_dc(surface, &dc);
-  if (FAILED(hr) || !dc)
-  {
-    if (InterlockedIncrement(&g_failure_logged) <= 4)
-      LogLine("startup disclaimer draw failed: GetDC hr=0x%08lX", (DWORD)hr);
+  if (!EnsureImage())
     return 0;
-  }
 
-  int surface_w = 0;
-  int surface_h = 0;
-  if (!ResolveDisclaimerSurfaceSize(dc, &desc, &surface_w, &surface_h))
+  if (InterlockedCompareExchange(&g_hold_done, 0, 0) == 0)
   {
-    release_dc(surface, dc);
-    return 0;
-  }
-
-  const int image_w = g_image.width;
-  const int image_h = g_image.height;
-  int dst_w = surface_w;
-  int dst_h = (int)(((int64_t)surface_w * image_h) / image_w);
-  if (dst_h > surface_h)
-  {
-    dst_h = surface_h;
-    dst_w = (int)(((int64_t)surface_h * image_w) / image_h);
-  }
-  if (dst_w <= 0 || dst_h <= 0)
-  {
-    release_dc(surface, dc);
-    return 0;
-  }
-
-  const int dst_x = (surface_w - dst_w) / 2;
-  const int dst_y = (surface_h - dst_h) / 2;
-  HDC draw_dc = dc;
-  if (EnsureFrameBuffer(dc, surface_w, surface_h))
-    draw_dc = g_frame.dc;
-
-  BITMAPINFO bmi;
-  memset(&bmi, 0, sizeof(bmi));
-  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  bmi.bmiHeader.biWidth = image_w;
-  bmi.bmiHeader.biHeight = -image_h;
-  bmi.bmiHeader.biPlanes = 1;
-  bmi.bmiHeader.biBitCount = 32;
-  bmi.bmiHeader.biCompression = BI_RGB;
-
-  SetStretchBltMode(draw_dc, COLORONCOLOR);
-  SetBrushOrgEx(draw_dc, 0, 0, NULL);
-  PatBlt(draw_dc, 0, 0, surface_w, surface_h, BLACKNESS);
-  const BYTE alpha = FadeAlpha(elapsed);
-  const BYTE* pixels = PixelsForAlpha(alpha);
-  StretchDIBits(draw_dc, dst_x, dst_y, dst_w, dst_h,
-                0, 0, image_w, image_h,
-                pixels, &bmi, DIB_RGB_COLORS, SRCCOPY);
-  if (draw_dc != dc)
-    BitBlt(dc, 0, 0, surface_w, surface_h, draw_dc, 0, 0, SRCCOPY);
-
-  release_dc(surface, dc);
-
-  const LONG draws = InterlockedIncrement(&g_draws);
-  const int effective_present =
-    present_event || ((desc.ddsCaps.dwCaps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER)) != 0);
-  const LONG presents = effective_present ? InterlockedIncrement(&g_presents) : g_presents;
-  if (InterlockedIncrement(&g_draw_logged) <= 4)
-  {
-    LogLine("startup disclaimer draw #%ld present=%ld alpha=%u via=%s "
-            "surface=%dx%d dst=%dx%d+%d+%d caps=0x%08lX",
-            draws, presents, (unsigned)alpha, reason ? reason : "unknown",
-            surface_w, surface_h, dst_w, dst_h, dst_x, dst_y,
-            desc.ddsCaps.dwCaps);
-  }
-
-  if (draws >= STARTUP_DISCLAIMER_MAX_DRAWS || presents >= STARTUP_DISCLAIMER_MAX_PRESENTS)
-    RetireDisclaimer("frame-limit", elapsed);
-  if (effective_present)
     HoldAfterPresent(surface, elapsed);
-  return 1;
+    return 1;
+  }
+
+  return 0;
 }
 
 static void PatchDisclaimerSurface(void* surface, const DDSURFACEDESC_COMPAT* desc)
 {
-  if (!surface || !IsDisclaimerSurfaceDesc(desc))
+  if (!surface || g_retired || !IsDisclaimerSurfaceDesc(desc))
     return;
 
   const LONG seen = InterlockedIncrement(&g_surface_seen);
@@ -1150,8 +1298,8 @@ static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Blt(void* self, RECT* dst, void*
     return E_FAIL;
 
   HRESULT hr = orig(self, dst, src, src_rect, flags, fx);
-  if (SUCCEEDED(hr))
-    DrawDisclaimer(self, "Blt", 0);
+  if (SUCCEEDED(hr) && !g_retired)
+    DrawDisclaimer(self, 0);
   return hr;
 }
 
@@ -1166,8 +1314,8 @@ static HRESULT STDMETHODCALLTYPE Hook_DDSurface_BltFast(void* self, DWORD x, DWO
     return E_FAIL;
 
   HRESULT hr = orig(self, x, y, src, src_rect, trans);
-  if (SUCCEEDED(hr))
-    DrawDisclaimer(self, "BltFast", 0);
+  if (SUCCEEDED(hr) && !g_retired)
+    DrawDisclaimer(self, 0);
   return hr;
 }
 
@@ -1181,14 +1329,14 @@ static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Flip(void* self, void* target_ov
     return E_FAIL;
 
   HRESULT hr = orig(self, target_override, flags);
-  if (SUCCEEDED(hr))
-    DrawDisclaimer(self, "Flip", 1);
+  if (SUCCEEDED(hr) && !g_retired)
+    DrawDisclaimer(self, 1);
   return hr;
 }
 
 static void TraceCreatedSurface(void* surface, const DDSURFACEDESC_COMPAT* desc, HRESULT hr)
 {
-  if (SUCCEEDED(hr) && surface)
+  if (SUCCEEDED(hr) && surface && !g_retired)
   {
     PatchVTableSlot(surface, 0, (void*)Hook_QueryInterface);
     PatchDisclaimerSurface(surface, desc);
@@ -1208,20 +1356,6 @@ static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC
   return hr;
 }
 
-static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width, DWORD height,
-                                                        DWORD bpp)
-{
-  DirectDrawSetDisplayModeProc orig =
-    (DirectDrawSetDisplayModeProc)GetOriginal(*(void***)self, 21);
-  if (!orig)
-    return E_FAIL;
-
-  HRESULT hr = orig(self, width, height, bpp);
-  if (SUCCEEDED(hr))
-    RememberDisplayMode(width, height, bpp, "SetDisplayMode");
-  return hr;
-}
-
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj)
 {
   QueryInterfaceProc orig = (QueryInterfaceProc)GetOriginal(*(void***)self, 0);
@@ -1229,7 +1363,7 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
     return E_NOINTERFACE;
 
   HRESULT hr = orig(self, riid, ppvObj);
-  if (SUCCEEDED(hr) && ppvObj && *ppvObj)
+  if (SUCCEEDED(hr) && ppvObj && *ppvObj && !g_retired)
   {
     PatchVTableSlot(*ppvObj, 0, (void*)Hook_QueryInterface);
     if (IsGuid(riid, &kIID_IDirectDraw2))
@@ -1249,7 +1383,6 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   {
     PatchVTableSlot(*lplpDD, 0, (void*)Hook_QueryInterface);
     PatchVTableSlot(*lplpDD, 6, (void*)Hook_DD_CreateSurface);
-    PatchVTableSlot(*lplpDD, 21, (void*)Hook_DD_SetDisplayMode);
   }
 
   return hr;
@@ -1344,11 +1477,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   else if (reason == DLL_PROCESS_DETACH)
   {
     LogLine("startup disclaimer summary loadState=%ld surfaces=%ld patched=%ld "
-            "draws=%ld presents=%ld hold=%ld retired=%ld displayMode=%ld %ldx%ldx%ld",
+            "draws=%ld presents=%ld hold=%ld retired=%ld window=%ldx%ld layout=%ld",
             g_load_state, g_surface_seen, g_surface_patched,
             g_draws, g_presents, g_hold_done, g_retired,
-            g_display_mode_changes, g_display_mode_width,
-            g_display_mode_height, g_display_mode_bpp);
+            g_window_width, g_window_height, g_layout_changes);
     if (!reserved)
     {
       ReleaseImage();
