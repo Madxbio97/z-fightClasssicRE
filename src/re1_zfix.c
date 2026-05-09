@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <intrin.h>
-#include <tlhelp32.h>
 
 #if defined(_MSC_VER)
 #pragma intrinsic(_ReturnAddress)
@@ -4209,11 +4208,29 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   return hr;
 }
 
-static int PatchDirectDrawCreateIAT(void)
+static int PatchLoadedModuleImports(HMODULE module)
 {
-  return ZfixPatchModuleImport(GetModuleHandleA(NULL), "DDRAW.dll",
+  return ZfixPatchModuleImport(module, "DDRAW.dll",
                                "DirectDrawCreate", (void*)Hook_DirectDrawCreate,
                                (void**)&g_real_direct_draw_create);
+}
+
+static int PatchAllImports(void)
+{
+  return ZfixPatchLoadedModules(PatchLoadedModuleImports);
+}
+
+static void LogDelayedImportPatch(DWORD pass, int patched)
+{
+  LogLine("delayed DirectDrawCreate imports pass=%lu patched=%d", pass, patched);
+}
+
+static DWORD WINAPI PatchImportsWorker(LPVOID param)
+{
+  (void)param;
+  ZfixRunDelayedImportPatches(PatchAllImports, ZFIX_IMPORT_REPATCH_PASSES,
+                              ZFIX_IMPORT_REPATCH_DELAY_MS, LogDelayedImportPatch);
+  return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
@@ -4264,7 +4281,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     LogLine("re1 d3d1 execute shadowClip=%d overlaySkip=%d qiLogging=%d",
             g_re1_d3d1_execute_shadow_clip, g_re1_d3d1_skip_screen_overlay_alpha,
             g_re1_d3d1_query_logging);
-    LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
+    LogLine("patch DirectDrawCreate imports=%d", PatchAllImports());
+    ZfixStartDetachedThread(PatchImportsWorker, NULL);
   }
   else if (reason == DLL_PROCESS_DETACH)
   {

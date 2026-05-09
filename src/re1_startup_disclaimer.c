@@ -1381,11 +1381,29 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   return hr;
 }
 
-static int PatchDirectDrawCreateIAT(void)
+static int PatchLoadedModuleImports(HMODULE module)
 {
-  return ZfixPatchModuleImport(GetModuleHandleA(NULL), "DDRAW.dll",
+  return ZfixPatchModuleImport(module, "DDRAW.dll",
                                "DirectDrawCreate", (void*)Hook_DirectDrawCreate,
                                (void**)&g_real_direct_draw_create);
+}
+
+static int PatchAllImports(void)
+{
+  return ZfixPatchLoadedModules(PatchLoadedModuleImports);
+}
+
+static void LogDelayedImportPatch(DWORD pass, int patched)
+{
+  LogLine("delayed DirectDrawCreate imports pass=%lu patched=%d", pass, patched);
+}
+
+static DWORD WINAPI PatchImportsWorker(LPVOID param)
+{
+  (void)param;
+  ZfixRunDelayedImportPatches(PatchAllImports, ZFIX_IMPORT_REPATCH_PASSES,
+                              ZFIX_IMPORT_REPATCH_DELAY_MS, LogDelayedImportPatch);
+  return 0;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
@@ -1402,7 +1420,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             "skip=action-fire(config)+J/XInputX/JoyButton1",
             g_log_enabled, STARTUP_DISCLAIMER_DURATION_MS, STARTUP_DISCLAIMER_FADE_IN_MS,
             STARTUP_DISCLAIMER_FADE_OUT_MS);
-    LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
+    LogLine("patch DirectDrawCreate imports=%d", PatchAllImports());
+    ZfixStartDetachedThread(PatchImportsWorker, NULL);
   }
   else if (reason == DLL_PROCESS_DETACH)
   {

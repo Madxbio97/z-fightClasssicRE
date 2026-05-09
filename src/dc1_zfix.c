@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <tlhelp32.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -295,7 +294,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
   }
 };
 
-static void PatchAllImports(void);
+static int PatchAllImports(void);
 static void PatchD3D9Device(void* device);
 static void* WINAPI Hook_Direct3DCreate9(UINT sdk_version);
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_CreateDevice(void* self, UINT adapter, DWORD device_type, HWND focus,
@@ -629,35 +628,27 @@ static int EnsureOwnedDepthSurface(void* self, const char* reason)
   return 0;
 }
 
-static void PatchLoadedModuleImports(HMODULE module)
+static int PatchLoadedModuleImports(HMODULE module)
 {
   int patched = ZfixPatchModuleImport(module, "d3d9.dll", "Direct3DCreate9",
                                       (void*)Hook_Direct3DCreate9,
                                       (void**)&g_real_direct3d_create9);
   if (patched)
     LogLine("patched Direct3DCreate9 imports=%d module=%p", patched, module);
+  return patched;
 }
 
-static void PatchAllImports(void)
+static int PatchAllImports(void)
 {
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
-  if (snap == INVALID_HANDLE_VALUE)
-  {
-    PatchLoadedModuleImports(GetModuleHandleA(NULL));
-    return;
-  }
+  return ZfixPatchLoadedModules(PatchLoadedModuleImports);
+}
 
-  MODULEENTRY32 me;
-  memset(&me, 0, sizeof(me));
-  me.dwSize = sizeof(me);
-  if (Module32First(snap, &me))
-  {
-    do
-    {
-      PatchLoadedModuleImports(me.hModule);
-    } while (Module32Next(snap, &me));
-  }
-  CloseHandle(snap);
+static DWORD WINAPI PatchImportsWorker(LPVOID param)
+{
+  (void)param;
+  ZfixRunDelayedImportPatches(PatchAllImports, ZFIX_IMPORT_REPATCH_PASSES,
+                              ZFIX_IMPORT_REPATCH_DELAY_MS, NULL);
+  return 0;
 }
 
 static DWORD VertexCountForPrimitive(DWORD primitive_type, UINT primitive_count)
@@ -2229,6 +2220,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_cutout_hard_alpha_high_min, g_cutout_model_two_sided,
             g_cutout_model_alpha_ref);
     PatchAllImports();
+    ZfixStartDetachedThread(PatchImportsWorker, NULL);
   }
   return TRUE;
 }
