@@ -40,9 +40,6 @@
 #define D3DRENDERSTATE_FOGENABLE 28
 #define D3DRENDERSTATE_TEXTUREADDRESSU 44
 #define D3DRENDERSTATE_TEXTUREADDRESSV 45
-#define D3DRENDERSTATE_MIPMAPLODBIAS 46
-#define D3DRENDERSTATE_RANGEFOGENABLE 48
-#define D3DRENDERSTATE_ANISOTROPY 49
 #define D3DCMP_EQUAL 3
 #define D3DCMP_LESSEQUAL 4
 #define D3DCMP_GREATER 5
@@ -65,10 +62,6 @@
 #define D3DRENDERSTATE_SUBPIXEL 31
 #define D3DRENDERSTATE_SUBPIXELX 32
 #define D3DSHADE_GOURAUD 2
-#define D3DTFG_POINT 1
-#define D3DTFG_LINEAR 2
-#define D3DTFN_POINT 1
-#define D3DTFN_LINEAR 2
 #define D3DBLEND_ZERO 1
 #define D3DBLEND_ONE 2
 #define D3DCULL_NONE 1
@@ -258,6 +251,7 @@ static DirectDrawCreateProc g_real_direct_draw_create = NULL;
 static HMODULE g_module = NULL;
 static char g_game_dir[MAX_PATH];
 static char g_log_path[MAX_PATH];
+static int g_log_enabled = 0;
 static volatile LONG g_draw_total = 0;
 static volatile LONG g_draw_model_accepted = 0;
 static volatile LONG g_draw_indexed_model_accepted = 0;
@@ -282,6 +276,8 @@ static volatile LONG g_texture_handle_logged = 0;
 static volatile LONG g_texture_qi_seen = 0;
 static volatile LONG g_texture_binding_count = 0;
 static volatile LONG g_texture_binding_logged = 0;
+static volatile LONG g_re2_mask_overlay_skipped = 0;
+static volatile LONG g_re2_mask_overlay_logged = 0;
 
 static const int g_enabled = 1;
 static const int g_diagnostics = 1;
@@ -327,6 +323,7 @@ static const int g_zbuffer_upgrade_variants = 1;
 static const int g_preferred_zbuffer_depth = 32;
 static const int g_fallback_zbuffer_depth = 24;
 static const int g_texture_handle_trace = 1;
+static const int g_re2_mask_overlay_guard = 1;
 
 static const float g_max_screen_extent = 360.0f;
 static const float g_max_screen_area = 60000.0f;
@@ -363,6 +360,16 @@ static const float g_adaptive_depth_small_min_extent = 1.25f;
 static const float g_adaptive_depth_small_strength = 0.70f;
 static const float g_adaptive_depth_rhw_signal = 0.00000001f;
 static const float g_adaptive_depth_axis_signal = 1.0f;
+static const float g_re2_mask_overlay_min_extent = 4.0f;
+static const float g_re2_mask_overlay_min_area = 48.0f;
+static const float g_re2_mask_overlay_max_extent = 4096.0f;
+static const float g_re2_mask_overlay_flat_z_span = 0.0020f;
+static const float g_re2_mask_overlay_flat_rhw_span = 0.0200f;
+static const float g_re2_mask_overlay_min_rhw = 0.5f;
+static const float g_re2_mask_overlay_axis_epsilon = 0.75f;
+static const DWORD g_re2_hires_mask_texture_min_side = 1024u;
+static const DWORD g_re2_classic_mask_texture_min_side = 256u;
+static const DWORD g_re2_classic_mask_texture_max_side = 512u;
 static const DWORD g_model_callsite_min = 0x0040E000u;
 static const DWORD g_model_callsite_max = 0x0040F800u;
 static const DWORD g_re2_batched_model_callsite = 0x004080D8u;
@@ -568,10 +575,23 @@ static void BuildLogPath(HINSTANCE instance)
 
 static void LogLine(const char* fmt, ...)
 {
+  if (!g_log_enabled || !g_diagnostics)
+    return;
+
   va_list args;
   va_start(args, fmt);
-  ZfixLogLineV(g_diagnostics, g_log_path, fmt, args);
+  ZfixLogLineV(1, g_log_path, fmt, args);
   va_end(args);
+}
+
+static LONG LogCounterIncrement(volatile LONG* counter)
+{
+  return (g_log_enabled && counter) ? InterlockedIncrement(counter) : 0;
+}
+
+static LONG LogCounterAdd(volatile LONG* counter, LONG value)
+{
+  return (g_log_enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
 }
 
 static void ResolveModuleForAddress(DWORD address, ModuleAddressInfo* info)
@@ -598,7 +618,7 @@ static void ResolveModuleForAddress(DWORD address, ModuleAddressInfo* info)
 
 static DrawCallsiteStats* FindOrCreateDrawCallsite(DWORD caller)
 {
-  if (!g_callsite_diagnostics || !caller)
+  if (!g_log_enabled || !g_callsite_diagnostics || !caller)
     return NULL;
 
   LONG count = g_draw_callsite_count;
@@ -680,6 +700,8 @@ static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD p
                             DWORD vertex_count, DWORD index_count, const DrawBounds* before,
                             const DrawBounds* after, DWORD adjusted_vertices)
 {
+  if (!g_log_enabled)
+    return;
   if (!before || !after)
     return;
 
@@ -713,6 +735,9 @@ static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD p
 
 static void LogDrawCallsiteSummary(const char* reason)
 {
+  if (!g_log_enabled)
+    return;
+
   LONG count = g_draw_callsite_count;
   if (count > (LONG)ARRAYSIZE(g_draw_callsites))
     count = (LONG)ARRAYSIZE(g_draw_callsites);
@@ -736,6 +761,9 @@ static void LogDrawCallsiteSummary(const char* reason)
           g_texture_surface_logged, g_texture_qi_seen, g_texture_binding_count,
           g_texture_binding_logged, g_texture_handle_seen, g_texture_handle_count,
           g_texture_handle_logged);
+  LogLine("summary re2_mask_overlay guard=%d skipped=%ld logged=%ld",
+          g_re2_mask_overlay_guard, g_re2_mask_overlay_skipped,
+          g_re2_mask_overlay_logged);
   for (LONG i = 0; i < count; i++)
   {
     DrawCallsiteStats* site = &g_draw_callsites[i];
@@ -1116,6 +1144,8 @@ static int IndicesAreValid(const WORD* indices, DWORD index_count, DWORD vertex_
 static void LogFlatDepthReject(DWORD caller, const char* label, const DrawBounds* bounds,
                                DWORD primitive_type, DWORD vertex_count, DWORD index_count)
 {
+  if (!g_log_enabled)
+    return;
   if (!bounds)
     return;
 
@@ -1768,20 +1798,23 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3DTLVERTEX_COMPAT* vertices, DW
   if (!changed)
     return 0;
 
-  InterlockedIncrement(&g_adaptive_depth_draws);
-  InterlockedExchangeAdd(&g_adaptive_depth_vertices, (LONG)changed);
-  const LONG logged = InterlockedIncrement(&g_adaptive_depth_logged);
-  if (logged <= 96)
+  LogCounterIncrement(&g_adaptive_depth_draws);
+  LogCounterAdd(&g_adaptive_depth_vertices, (LONG)changed);
+  if (g_log_enabled)
   {
-    ModuleAddressInfo info;
-    ResolveModuleForAddress(caller, &info);
-    LogLine("adaptive-depth #%ld %s profile=%s caller=%s+0x%08lX raw=0x%08lX "
-            "verts=%lu changed=%lu mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f "
-            "area=%.2f extent=%.2f maxShift=%.8f",
-            logged, label ? label : "draw", profile ? profile->name : "default",
-            info.module_name, info.module_offset, caller, vertex_count, changed,
-            mode_name, z_span, effective_span, rhw_span, bounds->area, extent,
-            max_shift);
+    const LONG logged = LogCounterIncrement(&g_adaptive_depth_logged);
+    if (logged <= 96)
+    {
+      ModuleAddressInfo info;
+      ResolveModuleForAddress(caller, &info);
+      LogLine("adaptive-depth #%ld %s profile=%s caller=%s+0x%08lX raw=0x%08lX "
+              "verts=%lu changed=%lu mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f "
+              "area=%.2f extent=%.2f maxShift=%.8f",
+              logged, label ? label : "draw", profile ? profile->name : "default",
+              info.module_name, info.module_offset, caller, vertex_count, changed,
+              mode_name, z_span, effective_span, rhw_span, bounds->area, extent,
+              max_shift);
+    }
   }
   return changed;
 }
@@ -1862,6 +1895,174 @@ static void FillProfileMatchInfo(DWORD caller, const DrawBounds* bounds,
     info->texture_width = texture_trace->width;
     info->texture_height = texture_trace->height;
   }
+}
+
+static ZfixTexturePageClass ClassifyCurrentD3D2MaskTexture(DWORD* out_texture)
+{
+  if (out_texture)
+    *out_texture = 0;
+  if (!g_re2_mask_overlay_guard)
+    return ZFIX_TEXTURE_PAGE_NONE;
+
+  const DWORD texture = TrackedRenderStateValue(D3DRENDERSTATE_TEXTUREHANDLE);
+  if (out_texture)
+    *out_texture = texture;
+  if (!texture || texture == 0xFFFFFFFFu)
+    return ZFIX_TEXTURE_PAGE_NONE;
+
+  const TextureHandleTrace* trace = FindTextureHandleTraceByHandle(texture);
+  if (!trace || !trace->width || !trace->height)
+    return ZFIX_TEXTURE_PAGE_NONE;
+
+  return ZfixClassifyMaskTexturePage(trace->width, trace->height,
+                                     g_re2_hires_mask_texture_min_side,
+                                     g_re2_classic_mask_texture_min_side,
+                                     g_re2_classic_mask_texture_max_side);
+}
+
+static int IsD3D2MaskOverlayPrimitiveShape(DWORD primitive_type, DWORD element_count, DWORD tris)
+{
+  if (tris != 2)
+    return 0;
+  if (primitive_type == D3DPT_TRIANGLELIST)
+    return element_count == 6;
+  if (primitive_type == D3DPT_TRIANGLESTRIP || primitive_type == D3DPT_TRIANGLEFAN)
+    return element_count == 4;
+  return 0;
+}
+
+static int D3D2VertexMatchesBoundsAxis(const D3DTLVERTEX_COMPAT* vertex,
+                                       const DrawBounds* bounds)
+{
+  if (!vertex || !bounds)
+    return 0;
+  if (!NearF(vertex->sx, bounds->min_x, g_re2_mask_overlay_axis_epsilon) &&
+      !NearF(vertex->sx, bounds->max_x, g_re2_mask_overlay_axis_epsilon))
+    return 0;
+  if (!NearF(vertex->sy, bounds->min_y, g_re2_mask_overlay_axis_epsilon) &&
+      !NearF(vertex->sy, bounds->max_y, g_re2_mask_overlay_axis_epsilon))
+    return 0;
+  return 1;
+}
+
+static int D3D2VerticesMatchBoundsAxis(const D3DTLVERTEX_COMPAT* vertices,
+                                       DWORD vertex_count, const WORD* indices,
+                                       DWORD index_count, const DrawBounds* bounds)
+{
+  if (!vertices || !bounds)
+    return 0;
+
+  if (indices && index_count)
+  {
+    for (DWORD i = 0; i < index_count; i++)
+    {
+      const DWORD idx = (DWORD)indices[i];
+      if (idx >= vertex_count ||
+          !D3D2VertexMatchesBoundsAxis(&vertices[idx], bounds))
+        return 0;
+    }
+    return 1;
+  }
+
+  for (DWORD i = 0; i < vertex_count; i++)
+  {
+    if (!D3D2VertexMatchesBoundsAxis(&vertices[i], bounds))
+      return 0;
+  }
+  return 1;
+}
+
+static int IsD3D2MaskOverlayBounds(const DrawBounds* bounds)
+{
+  if (!bounds)
+    return 0;
+
+  const float width = AbsF(bounds->width);
+  const float height = AbsF(bounds->height);
+  const float extent = width > height ? width : height;
+  if (width < g_re2_mask_overlay_min_extent ||
+      height < g_re2_mask_overlay_min_extent ||
+      bounds->area < g_re2_mask_overlay_min_area ||
+      extent > g_re2_mask_overlay_max_extent)
+    return 0;
+  if (AbsF(bounds->max_z - bounds->min_z) > g_re2_mask_overlay_flat_z_span)
+    return 0;
+  if (bounds->min_rhw < g_re2_mask_overlay_min_rhw ||
+      AbsF(bounds->max_rhw - bounds->min_rhw) > g_re2_mask_overlay_flat_rhw_span)
+    return 0;
+  return 1;
+}
+
+static int IsLikelyD3D2MaskOverlayDraw(const D3DTLVERTEX_COMPAT* vertices,
+                                       DWORD vertex_count, DWORD primitive_type,
+                                       const WORD* indices, DWORD index_count,
+                                       DWORD tris, DrawBounds* out_bounds,
+                                       ZfixTexturePageClass* out_texture_class,
+                                       DWORD* out_texture)
+{
+  if (out_texture_class)
+    *out_texture_class = ZFIX_TEXTURE_PAGE_NONE;
+  if (out_bounds)
+    memset(out_bounds, 0, sizeof(*out_bounds));
+
+  DWORD texture = 0;
+  const ZfixTexturePageClass texture_class = ClassifyCurrentD3D2MaskTexture(&texture);
+  if (out_texture)
+    *out_texture = texture;
+  if (texture_class == ZFIX_TEXTURE_PAGE_NONE || !vertices || vertex_count == 0)
+    return 0;
+
+  const DWORD element_count = indices ? index_count : vertex_count;
+  if (!IsD3D2MaskOverlayPrimitiveShape(primitive_type, element_count, tris))
+    return 0;
+
+  DrawBounds bounds;
+  int bounds_ok = 0;
+  if (indices)
+    bounds_ok = ComputeIndexedDrawBounds(vertices, vertex_count, indices, index_count, &bounds);
+  else
+  {
+    ComputeDrawBounds(vertices, vertex_count, &bounds);
+    bounds_ok = 1;
+  }
+  if (!bounds_ok || !IsD3D2MaskOverlayBounds(&bounds))
+    return 0;
+  if (!D3D2VerticesMatchBoundsAxis(vertices, vertex_count, indices, index_count, &bounds))
+    return 0;
+
+  if (out_bounds)
+    *out_bounds = bounds;
+  if (out_texture_class)
+    *out_texture_class = texture_class;
+  return 1;
+}
+
+static void LogD3D2MaskOverlaySkip(DWORD caller, int indexed, DWORD primitive_type,
+                                   DWORD vertex_count, DWORD index_count, DWORD tris,
+                                   DWORD texture, ZfixTexturePageClass texture_class,
+                                   const DrawBounds* bounds)
+{
+  if (!g_log_enabled)
+    return;
+
+  const LONG skipped = InterlockedIncrement(&g_re2_mask_overlay_skipped);
+  const LONG logged = InterlockedIncrement(&g_re2_mask_overlay_logged);
+  if (logged > 96)
+    return;
+
+  ModuleAddressInfo info;
+  ResolveModuleForAddress(caller, &info);
+  LogLine("re2 mask-overlay-skip #%ld reason=%s caller=%s+0x%08lX raw=0x%08lX "
+          "indexed=%d type=%lu verts=%lu indices=%lu tris=%lu texture=0x%08lX "
+          "xy=[%.2f..%.2f %.2f..%.2f] z=[%.6f..%.6f] rhw=[%.8f..%.8f]",
+          skipped,
+          texture_class == ZFIX_TEXTURE_PAGE_HIRES ? "hires-texture" : "classic-texture",
+          info.module_name, info.module_offset, caller, indexed, primitive_type,
+          vertex_count, index_count, tris, texture,
+          bounds ? bounds->min_x : 0.0f, bounds ? bounds->max_x : 0.0f,
+          bounds ? bounds->min_y : 0.0f, bounds ? bounds->max_y : 0.0f,
+          bounds ? bounds->min_z : 0.0f, bounds ? bounds->max_z : 0.0f,
+          bounds ? bounds->min_rhw : 0.0f, bounds ? bounds->max_rhw : 0.0f);
 }
 
 static const ZfixCallsiteProfile* FindModelCallsiteProfileForDraw(DWORD caller,
@@ -2166,9 +2367,9 @@ static void RunModelDepthPrepass(void* self, D3DDevice2DrawPrimitiveProc orig,
   ApplyBatchRenderState(self, &restore_state);
 
   if (SUCCEEDED(hr))
-    InterlockedIncrement(&g_model_depth_prepass_draws);
+    LogCounterIncrement(&g_model_depth_prepass_draws);
   else
-    InterlockedIncrement(&g_model_depth_prepass_failures);
+    LogCounterIncrement(&g_model_depth_prepass_failures);
 }
 
 static void RunIndexedModelDepthPrepass(void* self, D3DDevice2DrawIndexedPrimitiveProc orig,
@@ -2189,9 +2390,9 @@ static void RunIndexedModelDepthPrepass(void* self, D3DDevice2DrawIndexedPrimiti
   ApplyBatchRenderState(self, &restore_state);
 
   if (SUCCEEDED(hr))
-    InterlockedIncrement(&g_model_depth_prepass_draws);
+    LogCounterIncrement(&g_model_depth_prepass_draws);
   else
-    InterlockedIncrement(&g_model_depth_prepass_failures);
+    LogCounterIncrement(&g_model_depth_prepass_failures);
 }
 
 static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitiveProc orig, DWORD primitive_type,
@@ -2219,7 +2420,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                        profile, caller, "opaque-dp");
@@ -2268,7 +2469,7 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                        profile, caller, "opaque-dip");
@@ -2326,7 +2527,7 @@ static HRESULT DrawPrimitiveWithTransparentModelDepth(void* self, D3DDevice2Draw
       ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
       if (profile)
-        InterlockedIncrement(&g_callsite_profile_hits);
+        LogCounterIncrement(&g_callsite_profile_hits);
       const DWORD adaptive_changed =
         ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                            profile, caller, "cutout-dp");
@@ -2390,7 +2591,7 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
         ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
       if (profile)
-        InterlockedIncrement(&g_callsite_profile_hits);
+        LogCounterIncrement(&g_callsite_profile_hits);
       const DWORD adaptive_changed =
         ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                            profile, caller, "cutout-dip");
@@ -2846,18 +3047,21 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_BeginScene(void* self)
 
 static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_EndScene(void* self)
 {
-  const LONG scene = InterlockedIncrement(&g_scene_counter);
-  if (scene <= 8 || (scene % 120) == 0)
+  if (g_log_enabled)
   {
-    LogLine("scene=%ld total=%ld acceptDP=%ld acceptDIP=%ld transparent=%ld cutout=%ld "
-            "rejected=%ld zsamples=%ld prepass=%ld/%ld",
-            scene, g_draw_total, g_draw_model_accepted, g_draw_indexed_model_accepted,
-            g_draw_transparent_accepted, g_draw_cutout_accepted, g_draw_rejected,
-            g_zfight_sample_logged, g_model_depth_prepass_draws,
-            g_model_depth_prepass_failures);
+    const LONG scene = InterlockedIncrement(&g_scene_counter);
+    if (scene <= 8 || (scene % 120) == 0)
+    {
+      LogLine("scene=%ld total=%ld acceptDP=%ld acceptDIP=%ld transparent=%ld cutout=%ld "
+              "rejected=%ld zsamples=%ld prepass=%ld/%ld",
+              scene, g_draw_total, g_draw_model_accepted, g_draw_indexed_model_accepted,
+              g_draw_transparent_accepted, g_draw_cutout_accepted, g_draw_rejected,
+              g_zfight_sample_logged, g_model_depth_prepass_draws,
+              g_model_depth_prepass_failures);
+    }
+    if (scene == 60 || scene == 240 || (scene % 720) == 0)
+      LogDrawCallsiteSummary("scene");
   }
-  if (scene == 60 || scene == 240 || (scene % 720) == 0)
-    LogDrawCallsiteSummary("scene");
 
   D3DDevice2EndSceneProc orig = (D3DDevice2EndSceneProc)GetOriginal(*(void***)self, 11);
   return orig ? orig(self) : D3D_OK;
@@ -2877,7 +3081,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   if (!orig)
     return D3D_OK;
   const DWORD caller = (DWORD)(uintptr_t)_ReturnAddress();
-  InterlockedIncrement(&g_draw_total);
+  LogCounterIncrement(&g_draw_total);
 
   if (!g_enabled || vertex_type != D3DVT_TLVERTEX || !vertices || vertex_count == 0)
   {
@@ -2886,6 +3090,24 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   }
 
   const DWORD tris = TriangleCount(primitive_type, vertex_count);
+  DrawBounds mask_bounds;
+  ZfixTexturePageClass mask_texture_class = ZFIX_TEXTURE_PAGE_NONE;
+  DWORD mask_texture = 0;
+  if (IsLikelyD3D2MaskOverlayDraw((const D3DTLVERTEX_COMPAT*)vertices, vertex_count,
+                                  primitive_type, NULL, 0, tris, &mask_bounds,
+                                  &mask_texture_class, &mask_texture))
+  {
+    LogCounterIncrement(&g_draw_rejected);
+    TrackDrawCallsite(caller, "reject", 0, 0, primitive_type, vertex_count, 0, tris,
+                      mask_texture_class == ZFIX_TEXTURE_PAGE_HIRES ?
+                      "mask_overlay_hires" : "mask_overlay_classic",
+                      &mask_bounds);
+    LogD3D2MaskOverlaySkip(caller, 0, primitive_type, vertex_count, 0, tris,
+                           mask_texture, mask_texture_class, &mask_bounds);
+    ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, NULL, 0);
+    return orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
+  }
+
   DrawBounds bounds;
   const char* reason = NULL;
   const int model_ok = IsModelDepthDraw((const D3DTLVERTEX_COMPAT*)vertices, primitive_type, vertex_count, tris,
@@ -2907,9 +3129,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
       const AlphaModelClass alpha_class =
         ClassifyAlphaModel((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, min_alpha);
       if (alpha_class == ALPHA_MODEL_CUTOUT)
-        InterlockedIncrement(&g_draw_cutout_accepted);
+        LogCounterIncrement(&g_draw_cutout_accepted);
       else
-        InterlockedIncrement(&g_draw_transparent_accepted);
+        LogCounterIncrement(&g_draw_transparent_accepted);
       TrackDrawCallsite(caller, "accept", 0, 1, primitive_type, vertex_count, 0, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
@@ -2918,14 +3140,14 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
                                                    alpha_class);
     }
     ComputeDrawBounds((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, &bounds);
-    InterlockedIncrement(&g_draw_rejected);
+    LogCounterIncrement(&g_draw_rejected);
     TrackDrawCallsite(caller, "reject", 0, 0, primitive_type, vertex_count, 0, tris,
                       reason, &bounds);
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, NULL, 0);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
   }
 
-  InterlockedIncrement(&g_draw_model_accepted);
+  LogCounterIncrement(&g_draw_model_accepted);
   TrackDrawCallsite(caller, "accept", 0, 0, primitive_type, vertex_count, 0, tris,
                     "ok", &bounds);
   return DrawPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count, flags,
@@ -2941,7 +3163,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   if (!orig)
     return D3D_OK;
   const DWORD caller = (DWORD)(uintptr_t)_ReturnAddress();
-  InterlockedIncrement(&g_draw_total);
+  LogCounterIncrement(&g_draw_total);
 
   if (!g_enabled || vertex_type != D3DVT_TLVERTEX || !vertices || !indices || vertex_count == 0 || index_count == 0)
   {
@@ -2950,6 +3172,25 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   }
 
   const DWORD tris = TriangleCount(primitive_type, index_count);
+  DrawBounds mask_bounds;
+  ZfixTexturePageClass mask_texture_class = ZFIX_TEXTURE_PAGE_NONE;
+  DWORD mask_texture = 0;
+  if (IsLikelyD3D2MaskOverlayDraw((const D3DTLVERTEX_COMPAT*)vertices, vertex_count,
+                                  primitive_type, indices, index_count, tris,
+                                  &mask_bounds, &mask_texture_class, &mask_texture))
+  {
+    LogCounterIncrement(&g_draw_rejected);
+    TrackDrawCallsite(caller, "reject", 1, 0, primitive_type, vertex_count,
+                      index_count, tris,
+                      mask_texture_class == ZFIX_TEXTURE_PAGE_HIRES ?
+                      "mask_overlay_hires" : "mask_overlay_classic",
+                      &mask_bounds);
+    LogD3D2MaskOverlaySkip(caller, 1, primitive_type, vertex_count, index_count, tris,
+                           mask_texture, mask_texture_class, &mask_bounds);
+    ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, indices, index_count);
+    return orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
+  }
+
   DrawBounds bounds;
   const char* reason = NULL;
   const int indices_ok = IndicesAreValid(indices, index_count, vertex_count);
@@ -2976,9 +3217,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
         ClassifyIndexedAlphaModel((const D3DTLVERTEX_COMPAT*)vertices, vertex_count,
                                   indices, index_count, min_alpha);
       if (alpha_class == ALPHA_MODEL_CUTOUT)
-        InterlockedIncrement(&g_draw_cutout_accepted);
+        LogCounterIncrement(&g_draw_cutout_accepted);
       else
-        InterlockedIncrement(&g_draw_transparent_accepted);
+        LogCounterIncrement(&g_draw_transparent_accepted);
       TrackDrawCallsite(caller, "accept", 1, 1, primitive_type, vertex_count, index_count, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
@@ -2997,7 +3238,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
       ComputeDrawBounds((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, &bounds);
     }
 
-    InterlockedIncrement(&g_draw_rejected);
+    LogCounterIncrement(&g_draw_rejected);
     if (bounds_ok)
     {
       TrackDrawCallsite(caller, "reject", 1, 0, primitive_type, vertex_count, index_count, tris,
@@ -3012,7 +3253,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
   }
 
-  InterlockedIncrement(&g_draw_indexed_model_accepted);
+  LogCounterIncrement(&g_draw_indexed_model_accepted);
   TrackDrawCallsite(caller, "accept", 1, 0, primitive_type, vertex_count, index_count, tris,
                     "ok", &bounds);
   return DrawIndexedPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count,
@@ -3141,12 +3382,14 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   {
     g_module = instance;
     BuildLogPath(instance);
-    DeleteFileA(g_log_path);
+    g_log_enabled = ZfixLogEnabledByMarker(g_log_path);
+    if (g_log_enabled)
+      DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
     for (DWORD i = 0; i < ARRAYSIZE(g_render_state_cache); i++)
       g_render_state_cache[i] = 0xFFFFFFFFu;
-    LogLine("re2_zfix loaded diagnostics=%d model_callsite=0x%08lX..0x%08lX",
-            g_diagnostics, g_model_callsite_min, g_model_callsite_max);
+    LogLine("re2_zfix loaded log=%d diagnostics=%d model_callsite=0x%08lX..0x%08lX",
+            g_log_enabled, g_diagnostics, g_model_callsite_min, g_model_callsite_max);
     LogLine("depth zbuffer=%d/%d clearEachScene=%d prepass=%d colorZWrite=%d colorZFunc=%d alphaRef=%lu",
             g_preferred_zbuffer_depth, g_fallback_zbuffer_depth, g_clear_depth_each_scene,
             g_model_depth_prepass, g_model_color_pass_z_write, g_model_color_pass_z_func,
@@ -3176,6 +3419,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             "gouraud=%d dither=%d subpixel=%d",
             g_model_texture_perspective, g_model_alpha_test, g_model_alpha_ref, g_model_alpha_func,
             g_model_gouraud_shading, g_model_dither, g_model_subpixel);
+    LogLine("re2 mask overlay guard=%d hiresMin=%lu classic=%lu..%lu flatZ=%.6f flatRhw=%.6f minRhw=%.2f",
+            g_re2_mask_overlay_guard, g_re2_hires_mask_texture_min_side,
+            g_re2_classic_mask_texture_min_side, g_re2_classic_mask_texture_max_side,
+            g_re2_mask_overlay_flat_z_span, g_re2_mask_overlay_flat_rhw_span,
+            g_re2_mask_overlay_min_rhw);
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
   }
   else if (reason == DLL_PROCESS_DETACH)

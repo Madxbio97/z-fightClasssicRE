@@ -139,6 +139,7 @@ typedef struct D3D9StateSnapshot {
 static HookEntry g_hooks[128];
 static volatile LONG g_hook_count = 0;
 static char g_log_path[MAX_PATH];
+static int g_log_enabled = 0;
 static Direct3DCreate9Proc g_real_direct3d_create9 = NULL;
 static int g_scene_open = 0;
 static DWORD g_current_fvf = 0;
@@ -286,10 +287,23 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
 
 static void LogLine(const char* fmt, ...)
 {
+  if (!g_log_enabled || !g_diagnostics)
+    return;
+
   va_list args;
   va_start(args, fmt);
-  ZfixLogLineV(g_diagnostics, g_log_path, fmt, args);
+  ZfixLogLineV(1, g_log_path, fmt, args);
   va_end(args);
+}
+
+static LONG LogCounterIncrement(volatile LONG* counter)
+{
+  return (g_log_enabled && counter) ? InterlockedIncrement(counter) : 0;
+}
+
+static LONG LogCounterAdd(volatile LONG* counter, LONG value)
+{
+  return (g_log_enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
 }
 
 static void BuildLogPath(HINSTANCE instance)
@@ -428,7 +442,7 @@ static int GetBackBufferDesc(void* self, D3DSURFACE_DESC_COMPAT* desc)
   HRESULT hr = get_back_buffer(self, 0, 0, D3DBACKBUFFER_TYPE_MONO, &back_buffer);
   if (FAILED(hr) || !back_buffer)
   {
-    const LONG failures = InterlockedIncrement(&g_owned_depth_failures);
+    const LONG failures = LogCounterIncrement(&g_owned_depth_failures);
     if (failures <= 16)
       LogLine("owned-depth backbuffer fail #%ld hr=0x%08X", failures, (unsigned)hr);
     return 0;
@@ -437,7 +451,7 @@ static int GetBackBufferDesc(void* self, D3DSURFACE_DESC_COMPAT* desc)
   const int ok = GetSurfaceDescCompat(back_buffer, desc);
   if (!ok)
   {
-    const LONG failures = InterlockedIncrement(&g_owned_depth_failures);
+    const LONG failures = LogCounterIncrement(&g_owned_depth_failures);
     if (failures <= 16)
       LogLine("owned-depth backbuffer desc fail #%ld surface=%p", failures, back_buffer);
   }
@@ -448,7 +462,7 @@ static int GetBackBufferDesc(void* self, D3DSURFACE_DESC_COMPAT* desc)
 static void LogCurrentDepthSurface(void* self, const char* reason)
 {
   static volatile LONG logs = 0;
-  const LONG log_id = InterlockedIncrement(&logs);
+  const LONG log_id = LogCounterIncrement(&logs);
   if (log_id > 24)
     return;
 
@@ -493,7 +507,7 @@ static int SetOwnedDepthSurface(void* self, const char* reason)
   HRESULT hr = set_depth(self, g_owned_depth_surface);
   if (SUCCEEDED(hr))
   {
-    const LONG sets = InterlockedIncrement(&g_owned_depth_sets);
+    const LONG sets = LogCounterIncrement(&g_owned_depth_sets);
     if (sets <= 32)
       LogLine("owned-depth set #%ld %s surface=%p size=%ux%u fmt=%lu",
               sets, reason ? reason : "unknown", g_owned_depth_surface,
@@ -501,7 +515,7 @@ static int SetOwnedDepthSurface(void* self, const char* reason)
     return 1;
   }
 
-  const LONG failures = InterlockedIncrement(&g_owned_depth_failures);
+  const LONG failures = LogCounterIncrement(&g_owned_depth_failures);
   if (failures <= 16)
     LogLine("owned-depth set fail #%ld %s hr=0x%08X surface=%p",
             failures, reason ? reason : "unknown", (unsigned)hr, g_owned_depth_surface);
@@ -555,7 +569,7 @@ static int EnsureOwnedDepthSurface(void* self, const char* reason)
     }
     if (FAILED(hr) || !surface)
     {
-      const LONG failures = InterlockedIncrement(&g_owned_depth_failures);
+      const LONG failures = LogCounterIncrement(&g_owned_depth_failures);
       if (failures <= 16)
         LogLine("owned-depth create fail #%ld %s hr=0x%08X size=%ux%u fmt=%lu bbFmt=%lu ms=%lu/%lu",
                 failures, reason ? reason : "unknown", (unsigned)hr,
@@ -570,7 +584,7 @@ static int EnsureOwnedDepthSurface(void* self, const char* reason)
     g_owned_depth_height = bb_desc.Height;
     g_owned_depth_format = formats[i];
 
-    const LONG creates = InterlockedIncrement(&g_owned_depth_creates);
+    const LONG creates = LogCounterIncrement(&g_owned_depth_creates);
     LogLine("owned-depth create #%ld %s surface=%p size=%ux%u fmt=%lu bbFmt=%lu ms=%lu/%lu",
             creates, reason ? reason : "unknown", surface,
             g_owned_depth_width, g_owned_depth_height, g_owned_depth_format,
@@ -1191,16 +1205,19 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3D9TLVERTEX* vertices, DWORD ve
   if (!changed)
     return 0;
 
-  InterlockedIncrement(&g_adaptive_depth_draws);
-  InterlockedExchangeAdd(&g_adaptive_depth_vertices, (LONG)changed);
-  const LONG logged = InterlockedIncrement(&g_adaptive_depth_logged);
-  if (logged <= 96)
+  LogCounterIncrement(&g_adaptive_depth_draws);
+  LogCounterAdd(&g_adaptive_depth_vertices, (LONG)changed);
+  if (g_log_enabled)
   {
-    LogLine("adaptive-depth #%ld %s profile=%s caller=0x%08lX verts=%lu changed=%lu "
-            "mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f area=%.2f extent=%.2f maxShift=%.8f",
-            logged, label ? label : "draw", profile ? profile->name : "default",
-            caller, vertex_count, changed, mode_name, z_span, effective_span,
-            rhw_span, bounds->area, extent, max_shift);
+    const LONG logged = LogCounterIncrement(&g_adaptive_depth_logged);
+    if (logged <= 96)
+    {
+      LogLine("adaptive-depth #%ld %s profile=%s caller=0x%08lX verts=%lu changed=%lu "
+              "mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f area=%.2f extent=%.2f maxShift=%.8f",
+              logged, label ? label : "draw", profile ? profile->name : "default",
+              caller, vertex_count, changed, mode_name, z_span, effective_span,
+              rhw_span, bounds->area, extent, max_shift);
+    }
   }
   return changed;
 }
@@ -1299,9 +1316,9 @@ static void ForceModelColorPassAfterPrepassState(void* self, const D3D9StateSnap
 static void CountModelDepthPrepass(HRESULT hr)
 {
   if (SUCCEEDED(hr))
-    InterlockedIncrement(&g_model_depth_prepass_draws);
+    LogCounterIncrement(&g_model_depth_prepass_draws);
   else
-    InterlockedIncrement(&g_model_depth_prepass_failures);
+    LogCounterIncrement(&g_model_depth_prepass_failures);
 }
 
 static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc orig, DWORD primitive_type,
@@ -1327,7 +1344,7 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                        profile, caller, "opaque-dpup");
@@ -1383,7 +1400,7 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
     ComputeDrawBounds(copy, num_vertices, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, num_vertices, &adjusted_bounds,
                                        profile, caller, "opaque-dipup");
@@ -1419,7 +1436,7 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD primitive_type, UINT primitive_count,
                                                           const void* vertex_data, UINT vertex_stride)
 {
-  InterlockedIncrement(&g_dpup_total);
+  LogCounterIncrement(&g_dpup_total);
   D3D9DrawPrimitiveUPProc orig = (D3D9DrawPrimitiveUPProc)GetOriginal(*(void***)self, 83);
   if (!orig)
     return D3D_OK;
@@ -1428,14 +1445,14 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
   if (!g_enabled || !vertex_data || vertex_stride != sizeof(D3D9TLVERTEX))
   {
     if (vertex_stride != sizeof(D3D9TLVERTEX))
-      InterlockedIncrement(&g_dpup_stride_rejected);
+      LogCounterIncrement(&g_dpup_stride_rejected);
     return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
   }
 
   const DWORD vertex_count = VertexCountForPrimitive(primitive_type, primitive_count);
   if (vertex_count == 0 || vertex_count > 4096)
   {
-    InterlockedIncrement(&g_dpup_other_rejected);
+    LogCounterIncrement(&g_dpup_other_rejected);
     return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
   }
 
@@ -1448,7 +1465,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
     CaptureRenderState(self, D3DRS_ALPHATESTENABLE, &alpha_test) && alpha_test != 0;
   if (g_reject_alpha_state_model_draws && (alpha_blend_enabled || alpha_test_enabled))
   {
-    InterlockedIncrement(&g_dpup_alpha_rejected);
+    LogCounterIncrement(&g_dpup_alpha_rejected);
     return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
   }
 
@@ -1457,31 +1474,31 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
                         alpha_blend_enabled, &bounds, &reason))
   {
     if (reason && strcmp(reason, "alpha") == 0)
-      InterlockedIncrement(&g_dpup_alpha_rejected);
+      LogCounterIncrement(&g_dpup_alpha_rejected);
     else if (reason && strcmp(reason, "axis") == 0)
-      InterlockedIncrement(&g_dpup_axis_rejected);
+      LogCounterIncrement(&g_dpup_axis_rejected);
     else if (reason && strcmp(reason, "rhw") == 0)
-      InterlockedIncrement(&g_dpup_rhw_rejected);
+      LogCounterIncrement(&g_dpup_rhw_rejected);
     else
-      InterlockedIncrement(&g_dpup_other_rejected);
+      LogCounterIncrement(&g_dpup_other_rejected);
     return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
   }
 
-  InterlockedIncrement(&g_dpup_accepted);
+  LogCounterIncrement(&g_dpup_accepted);
   return DrawPrimitiveUPWithModelDepth(self, orig, primitive_type, primitive_count, vertex_data,
                                        vertex_stride, vertex_count, caller);
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetRenderState(void* self, DWORD state, DWORD value)
 {
-  InterlockedIncrement(&g_set_render_state_calls);
+  LogCounterIncrement(&g_set_render_state_calls);
   D3D9SetRenderStateProc orig = (D3D9SetRenderStateProc)GetOriginal(*(void***)self, 57);
   return orig ? orig(self, state, value) : D3D_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetTexture(void* self, DWORD stage, void* texture)
 {
-  InterlockedIncrement(&g_set_texture_calls);
+  LogCounterIncrement(&g_set_texture_calls);
   D3D9SetTextureProc orig = (D3D9SetTextureProc)GetOriginal(*(void***)self, 65);
   if (stage == 0)
   {
@@ -1489,7 +1506,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetTexture(void* self, DWORD stage, v
     {
       g_current_texture0 = texture;
       UpdateCurrentTexture0Desc(texture);
-      InterlockedIncrement(&g_set_texture0_changes);
+      LogCounterIncrement(&g_set_texture0_changes);
     }
   }
   return orig ? orig(self, stage, texture) : D3D_OK;
@@ -1497,7 +1514,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetTexture(void* self, DWORD stage, v
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetFVF(void* self, DWORD fvf)
 {
-  InterlockedIncrement(&g_set_fvf_calls);
+  LogCounterIncrement(&g_set_fvf_calls);
   D3D9SetFVFProc orig = (D3D9SetFVFProc)GetOriginal(*(void***)self, 89);
   if (g_current_fvf != fvf)
     g_current_fvf = fvf;
@@ -1507,7 +1524,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_SetFVF(void* self, DWORD fvf)
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitive(void* self, DWORD primitive_type, UINT start_vertex,
                                                         UINT primitive_count)
 {
-  InterlockedIncrement(&g_dp_calls);
+  LogCounterIncrement(&g_dp_calls);
   D3D9DrawPrimitiveProc orig = (D3D9DrawPrimitiveProc)GetOriginal(*(void***)self, 81);
   return orig ? orig(self, primitive_type, start_vertex, primitive_count) : D3D_OK;
 }
@@ -1517,7 +1534,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitive(void* self, DWOR
                                                                UINT num_vertices, UINT start_index,
                                                                UINT primitive_count)
 {
-  InterlockedIncrement(&g_dip_calls);
+  LogCounterIncrement(&g_dip_calls);
   D3D9DrawIndexedPrimitiveProc orig = (D3D9DrawIndexedPrimitiveProc)GetOriginal(*(void***)self, 82);
   return orig ? orig(self, primitive_type, base_vertex_index, min_vertex_index, num_vertices,
                      start_index, primitive_count) : D3D_OK;
@@ -1529,7 +1546,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
                                                                  DWORD index_format, const void* vertex_data,
                                                                  UINT vertex_stride)
 {
-  InterlockedIncrement(&g_dipup_total);
+  LogCounterIncrement(&g_dipup_total);
   D3D9DrawIndexedPrimitiveUPProc orig =
     (D3D9DrawIndexedPrimitiveUPProc)GetOriginal(*(void***)self, 84);
   if (!orig)
@@ -1541,7 +1558,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
       (index_format != D3DFMT_INDEX16 && index_format != D3DFMT_INDEX32) ||
       num_vertices == 0 || num_vertices > 4096 || index_count == 0 || index_count > 8192)
   {
-    InterlockedIncrement(&g_dipup_rejected);
+    LogCounterIncrement(&g_dipup_rejected);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
   }
@@ -1551,7 +1568,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
                                                  index_format, index_count);
   if (!indexed)
   {
-    InterlockedIncrement(&g_dipup_rejected);
+    LogCounterIncrement(&g_dipup_rejected);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
   }
@@ -1565,7 +1582,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
     CaptureRenderState(self, D3DRS_ALPHATESTENABLE, &alpha_test) && alpha_test != 0;
   if (g_reject_alpha_state_model_draws && (alpha_blend_enabled || alpha_test_enabled))
   {
-    InterlockedIncrement(&g_dipup_rejected);
+    LogCounterIncrement(&g_dipup_rejected);
     HeapFree(GetProcessHeap(), 0, indexed);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
@@ -1575,13 +1592,13 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   if (!IsModelDepthDraw(indexed, primitive_type, index_count, primitive_count,
                         alpha_blend_enabled, &bounds, &reason))
   {
-    InterlockedIncrement(&g_dipup_rejected);
+    LogCounterIncrement(&g_dipup_rejected);
     HeapFree(GetProcessHeap(), 0, indexed);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
   }
 
-  InterlockedIncrement(&g_dipup_accepted);
+  LogCounterIncrement(&g_dipup_accepted);
   HeapFree(GetProcessHeap(), 0, indexed);
   return DrawIndexedPrimitiveUPWithModelDepth(self, orig, primitive_type, min_vertex_index,
                                              num_vertices, primitive_count, index_data,
@@ -1600,13 +1617,13 @@ static void ClearDepthBufferForScene(void* self)
   const HRESULT hr = clear(self, 0, NULL, D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
   if (SUCCEEDED(hr))
   {
-    const LONG cleared = InterlockedIncrement(&g_depth_clear_count);
+    const LONG cleared = LogCounterIncrement(&g_depth_clear_count);
     if (cleared <= 16)
       LogLine("depth-clear #%ld ok", cleared);
   }
   else
   {
-    const LONG failed = InterlockedIncrement(&g_depth_clear_failures);
+    const LONG failed = LogCounterIncrement(&g_depth_clear_failures);
     if (failed <= 16)
       LogLine("depth-clear fail #%ld hr=0x%08X", failed, (unsigned)hr);
   }
@@ -1632,27 +1649,30 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_BeginScene(void* self)
 
 static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
 {
-  const LONG frame = InterlockedIncrement(&g_frame_counter);
-  if (frame <= g_initial_frame_summaries ||
-      (g_frame_summary_interval > 0 && (frame % g_frame_summary_interval) == 0))
+  if (g_log_enabled)
   {
-    LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld "
-            "dipup=%ld dipupAccepted=%ld dipupRejected=%ld depthPrepass=%ld/%ld depthClear=%ld depthFail=%ld "
-            "profiles=%ld adaptive=%ld/%ld "
-            "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
-            "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p wh=%ux%u curFVF=0x%lX "
-            "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
-            frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
-            g_dipup_total, g_dipup_accepted,
-            g_dipup_rejected, g_model_depth_prepass_draws, g_model_depth_prepass_failures,
-            g_depth_clear_count, g_depth_clear_failures,
-            g_callsite_profile_hits, g_adaptive_depth_draws, g_adaptive_depth_vertices,
-            g_dpup_stride_rejected, g_dpup_alpha_rejected, g_dpup_axis_rejected,
-            g_dpup_rhw_rejected, g_dpup_other_rejected,
-            g_set_texture_calls, g_set_texture0_changes, g_set_fvf_calls,
-            g_set_render_state_calls, g_current_texture0,
-            g_current_texture0_width, g_current_texture0_height, g_current_fvf,
-            g_owned_depth_creates, g_owned_depth_sets, g_owned_depth_failures);
+    const LONG frame = LogCounterIncrement(&g_frame_counter);
+    if (frame <= g_initial_frame_summaries ||
+        (g_frame_summary_interval > 0 && (frame % g_frame_summary_interval) == 0))
+    {
+      LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld "
+              "dipup=%ld dipupAccepted=%ld dipupRejected=%ld depthPrepass=%ld/%ld depthClear=%ld depthFail=%ld "
+              "profiles=%ld adaptive=%ld/%ld "
+              "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
+              "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p wh=%ux%u curFVF=0x%lX "
+              "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
+              frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
+              g_dipup_total, g_dipup_accepted,
+              g_dipup_rejected, g_model_depth_prepass_draws, g_model_depth_prepass_failures,
+              g_depth_clear_count, g_depth_clear_failures,
+              g_callsite_profile_hits, g_adaptive_depth_draws, g_adaptive_depth_vertices,
+              g_dpup_stride_rejected, g_dpup_alpha_rejected, g_dpup_axis_rejected,
+              g_dpup_rhw_rejected, g_dpup_other_rejected,
+              g_set_texture_calls, g_set_texture0_changes, g_set_fvf_calls,
+              g_set_render_state_calls, g_current_texture0,
+              g_current_texture0_width, g_current_texture0_height, g_current_fvf,
+              g_owned_depth_creates, g_owned_depth_sets, g_owned_depth_failures);
+    }
   }
   g_scene_open = 0;
   D3D9EndSceneProc orig = (D3D9EndSceneProc)GetOriginal(*(void***)self, 42);
@@ -1789,9 +1809,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   if (reason == DLL_PROCESS_ATTACH)
   {
     BuildLogPath(instance);
-    DeleteFileA(g_log_path);
+    g_log_enabled = ZfixLogEnabledByMarker(g_log_path);
+    if (g_log_enabled)
+      DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
-    LogLine("re3_zfix loaded");
+    LogLine("re3_zfix loaded log=%d", g_log_enabled);
     LogLine("depth prepass=%d colorZWrite=%d colorZFunc=%d",
             g_model_depth_prepass, g_model_color_pass_z_write,
             g_model_color_pass_z_func);

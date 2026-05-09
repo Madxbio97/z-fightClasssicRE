@@ -31,6 +31,12 @@ typedef enum AlphaModelClass {
   ALPHA_MODEL_CUTOUT = 1
 } AlphaModelClass;
 
+typedef enum ZfixTexturePageClass {
+  ZFIX_TEXTURE_PAGE_NONE = 0,
+  ZFIX_TEXTURE_PAGE_CLASSIC,
+  ZFIX_TEXTURE_PAGE_HIRES
+} ZfixTexturePageClass;
+
 static inline float AbsF(float v)
 {
   return v < 0.0f ? -v : v;
@@ -54,34 +60,26 @@ static inline float Clamp01(float v)
   return v;
 }
 
-static inline float LerpF(float a, float b, float t)
-{
-  return a + ((b - a) * t);
-}
-
-static inline float FloorF(float v)
-{
-  const int i = (int)v;
-  return (v < (float)i) ? (float)(i - 1) : (float)i;
-}
-
-static inline float HalfPixelCenter(float v)
-{
-  return FloorF(v) + 0.5f;
-}
-
 static inline int NearF(float a, float b, float eps)
 {
   return AbsF(a - b) <= eps;
 }
 
-static inline int ClampByteFromFloat(float v)
+static inline ZfixTexturePageClass ZfixClassifyMaskTexturePage(
+  DWORD width, DWORD height, DWORD hires_min_side,
+  DWORD classic_min_side, DWORD classic_max_side)
 {
-  if (v < 0.0f)
-    return 0;
-  if (v > 255.0f)
-    return 255;
-  return (int)(v + 0.5f);
+  if (!width || !height)
+    return ZFIX_TEXTURE_PAGE_NONE;
+
+  const DWORD min_side = width < height ? width : height;
+  const DWORD max_side = width > height ? width : height;
+  if (hires_min_side && min_side >= hires_min_side)
+    return ZFIX_TEXTURE_PAGE_HIRES;
+  if (classic_min_side && min_side >= classic_min_side &&
+      (!classic_max_side || max_side <= classic_max_side))
+    return ZFIX_TEXTURE_PAGE_CLASSIC;
+  return ZFIX_TEXTURE_PAGE_NONE;
 }
 
 static inline DWORD TriangleCount(DWORD primitive_type, DWORD vertex_or_index_count)
