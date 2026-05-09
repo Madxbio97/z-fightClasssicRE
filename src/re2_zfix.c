@@ -266,22 +266,12 @@ static volatile LONG g_draw_cutout_accepted = 0;
 static volatile LONG g_draw_rejected = 0;
 static volatile LONG g_zfight_sample_logged = 0;
 static volatile LONG g_scene_counter = 0;
-static volatile LONG g_model_uv_corrected_draws = 0;
-static volatile LONG g_model_uv_corrected_coords = 0;
-static volatile LONG g_model_uv_correction_logged = 0;
 static volatile LONG g_model_depth_prepass_draws = 0;
 static volatile LONG g_model_depth_prepass_failures = 0;
-static volatile LONG g_model_lighting_draws = 0;
-static volatile LONG g_model_lighting_vertices = 0;
-static volatile LONG g_model_cutout_expanded_draws = 0;
-static volatile LONG g_model_cutout_expanded_vertices = 0;
 static volatile LONG g_callsite_profile_hits = 0;
 static volatile LONG g_adaptive_depth_draws = 0;
 static volatile LONG g_adaptive_depth_vertices = 0;
 static volatile LONG g_adaptive_depth_logged = 0;
-static volatile LONG g_bad_draw_seen = 0;
-static volatile LONG g_bad_draw_logged = 0;
-static volatile LONG g_bad_draw_written = 0;
 static volatile LONG g_flat_depth_reject_logged = 0;
 static volatile LONG g_texture_surface_seen = 0;
 static volatile LONG g_texture_surface_count = 0;
@@ -303,7 +293,7 @@ static const int g_force_z_func = D3DCMP_LESSEQUAL;
 static const int g_force_z_bias = 0;
 static const int g_model_depth_prepass = 1;
 static const int g_model_color_pass_z_write = 0;
-static const int g_model_color_pass_z_func = D3DCMP_EQUAL;
+static const int g_model_color_pass_z_func = D3DCMP_LESSEQUAL;
 static const int g_restore_depth_state = 1;
 static const int g_clear_depth_each_scene = 1;
 static const int g_skip_axis_tile_draws = 1;
@@ -318,22 +308,17 @@ static const int g_transparent_model_z_func = D3DCMP_LESSEQUAL;
 static const int g_transparent_model_z_bias = ZFIX_SKIP_STATE;
 static const int g_cutout_model_disable_alpha_blend = 1;
 static const int g_cutout_model_two_sided = 1;
-static const int g_cutout_model_screen_expand = 1;
 static const int g_cutout_alpha_min = 224;
 static const int g_cutout_hard_alpha_low_max = 16;
 static const int g_cutout_hard_alpha_high_min = 240;
 static const DWORD g_cutout_model_alpha_ref = 16u;
-static const int g_model_texture_perspective = 1;
+static const int g_model_texture_perspective = 0;
 static const int g_model_alpha_test = 1;
 static const DWORD g_model_alpha_ref = 8u;
 static const DWORD g_model_alpha_func = D3DCMP_GREATER;
-static const int g_model_uv_correction = 1;
-static const int g_model_texture_aware_uv = 1;
-static const int g_model_lighting = 1;
-static const int g_model_lighting_translucent = 0;
-static const int g_model_gouraud_shading = 1;
-static const int g_model_dither = 1;
-static const int g_model_subpixel = 1;
+static const int g_model_gouraud_shading = 0;
+static const int g_model_dither = 0;
+static const int g_model_subpixel = 0;
 static const int g_callsite_profiles_enabled = 1;
 static const int g_adaptive_depth_conflict_resolver = 1;
 static const int g_upgrade_zbuffer_format = 1;
@@ -342,8 +327,6 @@ static const int g_zbuffer_upgrade_variants = 1;
 static const int g_preferred_zbuffer_depth = 32;
 static const int g_fallback_zbuffer_depth = 24;
 static const int g_texture_handle_trace = 1;
-static const int g_bad_draw_autologger = 1;
-static const int g_bad_draw_log_limit = 192;
 
 static const float g_max_screen_extent = 360.0f;
 static const float g_max_screen_area = 60000.0f;
@@ -355,20 +338,6 @@ static const float g_spike_long_extent = 260.0f;
 static const float g_spike_thin_extent = 2.0f;
 static const float g_min_depth_variance = 0.000001f;
 static const float g_min_rhw_variance = 0.00000001f;
-static const float g_model_uv_snap_grid = 255.0f;
-static const float g_model_uv_center_grid = 256.0f;
-static const float g_model_uv_snap_epsilon = 0.015f;
-static const float g_model_lighting_shadow_lift = 0.105f;
-static const float g_model_lighting_ambient_floor = 24.0f;
-static const float g_model_lighting_gain = 1.035f;
-static const float g_model_lighting_saturation = 1.045f;
-static const float g_model_lighting_direct = 0.105f;
-static const float g_model_lighting_rim = 0.030f;
-static const float g_model_lighting_depth_scale = 300.0f;
-static const float g_model_lighting_rhw_scale = 0.08f;
-static const float g_model_lighting_min_area = 0.25f;
-static const float g_model_lighting_max_luma_boost = 38.0f;
-static const float g_cutout_model_screen_expand_pixels = 0.18f;
 static const DWORD g_crow_profile_callsite = 0x0040EC01u;
 static const float g_crow_profile_flat_boost_z_span = 0.000180f;
 static const float g_crow_profile_flat_boost_target_span = 0.000940f;
@@ -377,10 +346,6 @@ static const float g_crow_profile_mid_boost_target_span = 0.001020f;
 static const int g_crow_profile_precision_snap = 1;
 static const float g_crow_profile_center_snap = 0.000004f;
 static const float g_crow_profile_span_snap = 0.000010f;
-static const float g_bad_draw_tiny_z_span = 0.000120f;
-static const float g_bad_draw_tiny_area = 80.0f;
-static const float g_bad_draw_over_span_ratio = 2.75f;
-static const float g_bad_draw_over_shift_abs = 0.000520f;
 static const float g_zfight_tiny_span = 0.000080f;
 static const float g_zfight_tiny_delta = 0.000030f;
 static const float g_adaptive_depth_flat_span = 0.000160f;
@@ -393,9 +358,9 @@ static const float g_adaptive_depth_min_extent = 2.0f;
 static const float g_adaptive_depth_max_extent = 960.0f;
 static const float g_adaptive_depth_normal_min_area = 28.0f;
 static const float g_adaptive_depth_normal_min_extent = 5.0f;
-static const float g_adaptive_depth_small_min_area = 12.0f;
-static const float g_adaptive_depth_small_min_extent = 3.0f;
-static const float g_adaptive_depth_small_strength = 0.55f;
+static const float g_adaptive_depth_small_min_area = 4.0f;
+static const float g_adaptive_depth_small_min_extent = 1.25f;
+static const float g_adaptive_depth_small_strength = 0.70f;
 static const float g_adaptive_depth_rhw_signal = 0.00000001f;
 static const float g_adaptive_depth_axis_signal = 1.0f;
 static const DWORD g_model_callsite_min = 0x0040E000u;
@@ -411,7 +376,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
-    D3DCMP_EQUAL,
+    D3DCMP_LESSEQUAL,
     0.000800f,
     0.000980f,
     0.000400f,
@@ -437,7 +402,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
-    D3DCMP_EQUAL,
+    D3DCMP_LESSEQUAL,
     0.000940f,
     0.001080f,
     0.000440f,
@@ -463,7 +428,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0x0040EC01u,
     0x0040EC01u,
     ZFIX_DEPTH_PROFILE_AGGRESSIVE,
-    D3DCMP_EQUAL,
+    D3DCMP_LESSEQUAL,
     0.001000f,
     0.001160f,
     0.000420f,
@@ -489,7 +454,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0x004080D8u,
     0x004080D8u,
     ZFIX_DEPTH_PROFILE_NORMAL,
-    D3DCMP_EQUAL,
+    D3DCMP_LESSEQUAL,
     0.000480f,
     0.000780f,
     0.000240f,
@@ -515,7 +480,7 @@ static const ZfixCallsiteProfile g_callsite_profiles[] = {
     0x0040E000u,
     0x0040F800u,
     ZFIX_DEPTH_PROFILE_NORMAL,
-    D3DCMP_EQUAL,
+    D3DCMP_LESSEQUAL,
     0.000430f,
     0.000760f,
     0.000230f,
@@ -765,18 +730,6 @@ static void LogDrawCallsiteSummary(const char* reason)
           g_callsite_profiles_enabled, (DWORD)ARRAYSIZE(g_callsite_profiles), g_callsite_profile_hits,
           g_adaptive_depth_conflict_resolver, g_adaptive_depth_draws,
           g_adaptive_depth_vertices, g_adaptive_depth_logged);
-  LogLine("summary bad_draw autologger=%d seen=%ld logged=%ld written=%ld limit=%d "
-          "tinyZ=%.8f tinyArea=%.1f overRatio=%.2f overAbs=%.8f",
-          g_bad_draw_autologger, g_bad_draw_seen, g_bad_draw_logged,
-          g_bad_draw_written, g_bad_draw_log_limit,
-          g_bad_draw_tiny_z_span, g_bad_draw_tiny_area,
-          g_bad_draw_over_span_ratio, g_bad_draw_over_shift_abs);
-  LogLine("summary model_uv enabled=%d correctedDraws=%ld correctedCoords=%ld logged=%ld",
-          g_model_uv_correction, g_model_uv_corrected_draws,
-          g_model_uv_corrected_coords, g_model_uv_correction_logged);
-  LogLine("summary model_lighting enabled=%d draws=%ld vertices=%ld cutoutExpand=%ld/%ld",
-          g_model_lighting, g_model_lighting_draws, g_model_lighting_vertices,
-          g_model_cutout_expanded_draws, g_model_cutout_expanded_vertices);
   LogLine("summary texture_trace enabled=%d surfaces=%ld surfaceSlots=%ld surfaceLogged=%ld "
           "textureQI=%ld bindings=%ld bindingLogged=%ld handleCalls=%ld handles=%ld handleLogged=%ld",
           g_texture_handle_trace, g_texture_surface_seen, g_texture_surface_count,
@@ -1833,236 +1786,6 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3DTLVERTEX_COMPAT* vertices, DW
   return changed;
 }
 
-static float ModelLightingDepth(const D3DTLVERTEX_COMPAT* v)
-{
-  return v ? (v->sz + (v->rhw * g_model_lighting_rhw_scale)) : 0.0f;
-}
-
-static float EstimateTriangleLighting(const D3DTLVERTEX_COMPAT* a,
-                                      const D3DTLVERTEX_COMPAT* b,
-                                      const D3DTLVERTEX_COMPAT* c)
-{
-  if (!a || !b || !c)
-    return 0.0f;
-
-  const float dx1 = b->sx - a->sx;
-  const float dy1 = b->sy - a->sy;
-  const float dx2 = c->sx - a->sx;
-  const float dy2 = c->sy - a->sy;
-  const float denom = (dx1 * dy2) - (dy1 * dx2);
-  if (AbsF(denom) < g_model_lighting_min_area)
-    return 0.0f;
-
-  const float dz1 = ModelLightingDepth(b) - ModelLightingDepth(a);
-  const float dz2 = ModelLightingDepth(c) - ModelLightingDepth(a);
-  const float dzdx = ((dz1 * dy2) - (dz2 * dy1)) / denom;
-  const float dzdy = ((dx1 * dz2) - (dx2 * dz1)) / denom;
-  const float nx = -dzdx * g_model_lighting_depth_scale;
-  const float ny = -dzdy * g_model_lighting_depth_scale;
-  const float normalizer = 1.0f + AbsF(nx) + AbsF(ny);
-  const float dot = ((nx * -0.34f) + (ny * -0.52f) + 0.86f) / normalizer;
-  const float direct = Clamp01((dot - 0.70f) * 2.15f) * g_model_lighting_direct;
-  const float rim = Clamp01((AbsF(nx) + AbsF(ny)) * 0.28f) * g_model_lighting_rim;
-  return direct + rim;
-}
-
-static void AccumulateVertexLight(float* light, DWORD* counts, DWORD vertex_count, DWORD i0,
-                                  DWORD i1, DWORD i2, const D3DTLVERTEX_COMPAT* vertices)
-{
-  if (!light || !counts || !vertices || i0 >= vertex_count || i1 >= vertex_count ||
-      i2 >= vertex_count)
-    return;
-
-  const float tri_light = EstimateTriangleLighting(&vertices[i0], &vertices[i1], &vertices[i2]);
-  if (tri_light <= 0.0f)
-    return;
-
-  light[i0] += tri_light;
-  light[i1] += tri_light;
-  light[i2] += tri_light;
-  counts[i0]++;
-  counts[i1]++;
-  counts[i2]++;
-}
-
-static void AccumulatePrimitiveLighting(float* light, DWORD* counts, DWORD vertex_count,
-                                        DWORD primitive_type, const WORD* indices,
-                                        DWORD index_count, const D3DTLVERTEX_COMPAT* vertices)
-{
-  const DWORD count = indices ? index_count : vertex_count;
-  if (!light || !counts || !vertices || count < 3)
-    return;
-
-  if (primitive_type == D3DPT_TRIANGLELIST)
-  {
-    for (DWORD i = 0; i + 2 < count; i += 3)
-    {
-      const DWORD i0 = indices ? (DWORD)indices[i] : i;
-      const DWORD i1 = indices ? (DWORD)indices[i + 1] : (i + 1);
-      const DWORD i2 = indices ? (DWORD)indices[i + 2] : (i + 2);
-      AccumulateVertexLight(light, counts, vertex_count, i0, i1, i2, vertices);
-    }
-    return;
-  }
-
-  if (primitive_type == D3DPT_TRIANGLESTRIP)
-  {
-    for (DWORD i = 0; i + 2 < count; i++)
-    {
-      const DWORD a = indices ? (DWORD)indices[i] : i;
-      const DWORD b = indices ? (DWORD)indices[i + 1] : (i + 1);
-      const DWORD c = indices ? (DWORD)indices[i + 2] : (i + 2);
-      if (i & 1u)
-        AccumulateVertexLight(light, counts, vertex_count, b, a, c, vertices);
-      else
-        AccumulateVertexLight(light, counts, vertex_count, a, b, c, vertices);
-    }
-    return;
-  }
-
-  if (primitive_type == D3DPT_TRIANGLEFAN)
-  {
-    const DWORD first = indices ? (DWORD)indices[0] : 0;
-    for (DWORD i = 1; i + 1 < count; i++)
-    {
-      const DWORD i1 = indices ? (DWORD)indices[i] : i;
-      const DWORD i2 = indices ? (DWORD)indices[i + 1] : (i + 1);
-      AccumulateVertexLight(light, counts, vertex_count, first, i1, i2, vertices);
-    }
-  }
-}
-
-static DWORD RelightVertexColors(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count,
-                                 const float* light, const DWORD* counts)
-{
-  if (!vertices || vertex_count == 0)
-    return 0;
-
-  DWORD changed = 0;
-  for (DWORD i = 0; i < vertex_count; i++)
-  {
-    const uint32_t color = vertices[i].color;
-    const int a = (int)((color >> 24) & 0xFFu);
-    float r = (float)((color >> 16) & 0xFFu);
-    float g = (float)((color >> 8) & 0xFFu);
-    float b = (float)(color & 0xFFu);
-    const float source_luma = (r * 0.299f) + (g * 0.587f) + (b * 0.114f);
-    float vertex_light = 0.0f;
-    if (light && counts && counts[i] > 0)
-      vertex_light = light[i] / (float)counts[i];
-
-    if (r < g_model_lighting_ambient_floor)
-      r += (g_model_lighting_ambient_floor - r) * 0.65f;
-    if (g < g_model_lighting_ambient_floor)
-      g += (g_model_lighting_ambient_floor - g) * 0.65f;
-    if (b < g_model_lighting_ambient_floor)
-      b += (g_model_lighting_ambient_floor - b) * 0.65f;
-
-    r += (255.0f - r) * g_model_lighting_shadow_lift * ((255.0f - r) / 255.0f);
-    g += (255.0f - g) * g_model_lighting_shadow_lift * ((255.0f - g) / 255.0f);
-    b += (255.0f - b) * g_model_lighting_shadow_lift * ((255.0f - b) / 255.0f);
-
-    const float luma = (r * 0.299f) + (g * 0.587f) + (b * 0.114f);
-    r = luma + ((r - luma) * g_model_lighting_saturation);
-    g = luma + ((g - luma) * g_model_lighting_saturation);
-    b = luma + ((b - luma) * g_model_lighting_saturation);
-
-    r = (r * g_model_lighting_gain) + (vertex_light * 255.0f);
-    g = (g * g_model_lighting_gain) + (vertex_light * 245.0f);
-    b = (b * g_model_lighting_gain) + (vertex_light * 230.0f);
-
-    const float out_luma = (r * 0.299f) + (g * 0.587f) + (b * 0.114f);
-    const float max_luma = source_luma + g_model_lighting_max_luma_boost;
-    if (out_luma > max_luma && out_luma > 0.001f)
-    {
-      const float scale = max_luma / out_luma;
-      r *= scale;
-      g *= scale;
-      b *= scale;
-    }
-
-    const uint32_t new_color = ((uint32_t)a << 24) |
-                               ((uint32_t)ClampByteFromFloat(r) << 16) |
-                               ((uint32_t)ClampByteFromFloat(g) << 8) |
-                               (uint32_t)ClampByteFromFloat(b);
-    if (new_color != color)
-    {
-      vertices[i].color = new_color;
-      changed++;
-    }
-  }
-
-  return changed;
-}
-
-static DWORD ApplyModelLighting(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count,
-                                DWORD primitive_type, const WORD* indices, DWORD index_count,
-                                int translucent)
-{
-  if (!g_model_lighting || !vertices || vertex_count == 0)
-    return 0;
-  if (translucent && !g_model_lighting_translucent)
-    return 0;
-
-  float* light = (float*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                   sizeof(float) * (SIZE_T)vertex_count);
-  DWORD* counts = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
-                                    sizeof(DWORD) * (SIZE_T)vertex_count);
-  if (light && counts)
-    AccumulatePrimitiveLighting(light, counts, vertex_count, primitive_type, indices,
-                                index_count, vertices);
-
-  const DWORD changed = RelightVertexColors(vertices, vertex_count, light, counts);
-  if (light)
-    HeapFree(GetProcessHeap(), 0, light);
-  if (counts)
-    HeapFree(GetProcessHeap(), 0, counts);
-
-  if (changed)
-  {
-    InterlockedIncrement(&g_model_lighting_draws);
-    InterlockedExchangeAdd(&g_model_lighting_vertices, (LONG)changed);
-  }
-  return changed;
-}
-
-static DWORD ApplyCutoutGeometryExpansion(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count)
-{
-  if (!g_cutout_model_screen_expand || !vertices || vertex_count < 3 ||
-      g_cutout_model_screen_expand_pixels <= 0.0f)
-    return 0;
-
-  float center_x = 0.0f;
-  float center_y = 0.0f;
-  for (DWORD i = 0; i < vertex_count; i++)
-  {
-    center_x += vertices[i].sx;
-    center_y += vertices[i].sy;
-  }
-  center_x /= (float)vertex_count;
-  center_y /= (float)vertex_count;
-
-  DWORD changed = 0;
-  for (DWORD i = 0; i < vertex_count; i++)
-  {
-    const float dx = vertices[i].sx - center_x;
-    const float dy = vertices[i].sy - center_y;
-    const float len = AbsF(dx) + AbsF(dy);
-    if (len <= 0.0001f)
-      continue;
-    vertices[i].sx += (dx / len) * g_cutout_model_screen_expand_pixels;
-    vertices[i].sy += (dy / len) * g_cutout_model_screen_expand_pixels;
-    changed++;
-  }
-
-  if (changed)
-  {
-    InterlockedIncrement(&g_model_cutout_expanded_draws);
-    InterlockedExchangeAdd(&g_model_cutout_expanded_vertices, (LONG)changed);
-  }
-  return changed;
-}
-
 static void TrackRenderState(DWORD state, DWORD value)
 {
   if (state < ARRAYSIZE(g_render_state_cache))
@@ -2153,152 +1876,6 @@ static const ZfixCallsiteProfile* FindModelCallsiteProfileForDraw(DWORD caller,
   FillProfileMatchInfo(caller, bounds, &info);
   return ZfixFindCallsiteProfileForDraw(g_callsite_profiles,
                                         (DWORD)ARRAYSIZE(g_callsite_profiles), &info);
-}
-
-static void LogBadDrawCandidate(DWORD caller, const char* kind, int indexed,
-                                DWORD primitive_type, DWORD vertex_count, DWORD index_count,
-                                const ZfixCallsiteProfile* profile,
-                                const DrawBounds* before, const DrawBounds* after,
-                                DWORD adjusted_vertices)
-{
-  if (!g_bad_draw_autologger || !before || !after)
-    return;
-
-  const float before_span = before->max_z - before->min_z;
-  const float after_span = after->max_z - after->min_z;
-  const float span_delta = after_span - before_span;
-  const float before_extent = AbsF(before->width) > AbsF(before->height) ?
-                              AbsF(before->width) : AbsF(before->height);
-
-  const char* reason = NULL;
-  if (before_span >= 0.0f && before_span <= g_bad_draw_tiny_z_span &&
-      before->area <= g_bad_draw_tiny_area)
-    reason = "tiny-area-zspan";
-  else if (before_span >= 0.0f && before_span <= g_bad_draw_tiny_z_span)
-    reason = "tiny-zspan";
-  else if (before_span > 0.0f &&
-           after_span > (before_span * g_bad_draw_over_span_ratio) &&
-           span_delta > g_bad_draw_over_shift_abs)
-    reason = "overshift-risk";
-  else if (!profile && before_span >= 0.0f && before_span <= g_adaptive_depth_flat_span)
-    reason = "profile-candidate";
-  if (!reason)
-    return;
-
-  InterlockedIncrement(&g_bad_draw_seen);
-  const LONG logged = InterlockedIncrement(&g_bad_draw_logged);
-  if (logged > g_bad_draw_log_limit)
-    return;
-  InterlockedIncrement(&g_bad_draw_written);
-
-  ZfixProfileMatchInfo info;
-  FillProfileMatchInfo(caller, before, &info);
-  ModuleAddressInfo address;
-  ResolveModuleForAddress(caller, &address);
-  LogLine("bad-draw #%ld reason=%s %s profile=%s caller=%s+0x%08lX raw=0x%08lX "
-          "indexed=%d type=%lu verts=%lu indices=%lu adjusted=%lu "
-          "zSpan=%.8f->%.8f delta=%.8f area=%.2f extent=%.2f "
-          "texture=0x%08lX wh=%lux%lu",
-          logged, reason, kind ? kind : "draw", profile ? profile->name : "none",
-          address.module_name, address.module_offset, caller, indexed, primitive_type,
-          vertex_count, index_count, adjusted_vertices,
-          before_span, after_span, span_delta, before->area, before_extent,
-          info.texture_handle, info.texture_width, info.texture_height);
-}
-
-static int GetCurrentTextureSize(DWORD* width, DWORD* height)
-{
-  if (width)
-    *width = 0;
-  if (height)
-    *height = 0;
-  if (!g_model_texture_aware_uv)
-    return 0;
-
-  const DWORD texture = TrackedRenderStateValue(D3DRENDERSTATE_TEXTUREHANDLE);
-  if (!texture || texture == 0xFFFFFFFFu)
-    return 0;
-
-  const TextureHandleTrace* texture_trace = FindTextureHandleTraceByHandle(texture);
-  if (!texture_trace || !texture_trace->width || !texture_trace->height)
-    return 0;
-
-  if (width)
-    *width = texture_trace->width;
-  if (height)
-    *height = texture_trace->height;
-  return 1;
-}
-
-static float AdjustModelTexCoord(float value, float snap_grid, float center_grid)
-{
-  if (snap_grid <= 0.0f || center_grid <= 0.0f)
-    return value;
-  if (value < -0.001f || value > 1.001f)
-    return value;
-
-  const float scaled = value * snap_grid;
-  int texel = (int)(scaled + 0.5f);
-  if (texel < 0)
-    texel = 0;
-  if (texel > (int)snap_grid)
-    texel = (int)snap_grid;
-  if (AbsF(scaled - (float)texel) > g_model_uv_snap_epsilon)
-    return value;
-
-  return ((float)texel + 0.5f) / center_grid;
-}
-
-// Model texture coordinate cleanup.
-static DWORD ApplyModelTexCoordCorrection(D3DTLVERTEX_COMPAT* vertices, DWORD vertex_count)
-{
-  if (!g_model_uv_correction || !vertices || vertex_count == 0)
-    return 0;
-
-  const float first_old_u = vertices[0].tu;
-  const float first_old_v = vertices[0].tv;
-  DWORD texture_width = 0;
-  DWORD texture_height = 0;
-  const int use_texture_size = GetCurrentTextureSize(&texture_width, &texture_height) &&
-                               texture_width > 1 && texture_height > 1;
-  const float u_snap_grid = use_texture_size ? (float)(texture_width - 1u) :
-                            g_model_uv_snap_grid;
-  const float v_snap_grid = use_texture_size ? (float)(texture_height - 1u) :
-                            g_model_uv_snap_grid;
-  const float u_center_grid = use_texture_size ? (float)texture_width :
-                              g_model_uv_center_grid;
-  const float v_center_grid = use_texture_size ? (float)texture_height :
-                              g_model_uv_center_grid;
-  DWORD changed = 0;
-  for (DWORD i = 0; i < vertex_count; i++)
-  {
-    const float old_u = vertices[i].tu;
-    const float old_v = vertices[i].tv;
-    const float new_u = AdjustModelTexCoord(old_u, u_snap_grid, u_center_grid);
-    const float new_v = AdjustModelTexCoord(old_v, v_snap_grid, v_center_grid);
-    vertices[i].tu = new_u;
-    vertices[i].tv = new_v;
-    if (new_u != old_u)
-      changed++;
-    if (new_v != old_v)
-      changed++;
-  }
-
-  if (changed)
-  {
-    InterlockedIncrement(&g_model_uv_corrected_draws);
-    InterlockedExchangeAdd(&g_model_uv_corrected_coords, (LONG)changed);
-    const LONG logged = InterlockedIncrement(&g_model_uv_correction_logged);
-    if (logged <= 64)
-    {
-      const DWORD texture = TrackedRenderStateValue(D3DRENDERSTATE_TEXTUREHANDLE);
-      LogLine("model-uv-correct #%ld texture=0x%08lX wh=%lux%lu verts=%lu coords=%lu "
-              "firstUV %.7f,%.7f -> %.7f,%.7f",
-              logged, texture, texture_width, texture_height, vertex_count, changed,
-              first_old_u, first_old_v, vertices[0].tu, vertices[0].tv);
-    }
-  }
-  return changed;
 }
 
 static int CaptureOneRenderState(void* self, DWORD state, DWORD* value)
@@ -2638,7 +2215,6 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
   }
 
   memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
-  ApplyModelTexCoordCorrection(copy, vertex_count);
   DrawBounds adjusted_bounds;
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
@@ -2649,11 +2225,9 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
                                        profile, caller, "opaque-dp");
   if (adaptive_changed)
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
-  ApplyModelLighting(copy, vertex_count, primitive_type, NULL, 0, 0);
   LogZFightSample(caller, "opaque-dp", 0, primitive_type, vertex_count, 0,
-                  bounds, &adjusted_bounds, adaptive_changed);
-  LogBadDrawCandidate(caller, "opaque-dp", 0, primitive_type, vertex_count, 0,
-                      profile, bounds, &adjusted_bounds, adaptive_changed);
+                  bounds, &adjusted_bounds,
+                  adaptive_changed);
 
   RunModelDepthPrepass(self, orig, primitive_type, vertex_type, copy, vertex_count, flags);
   ForceDepthStateForDraw(self);
@@ -2689,7 +2263,6 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
   }
 
   memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
-  ApplyModelTexCoordCorrection(copy, vertex_count);
   DrawBounds adjusted_bounds;
   if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
@@ -2702,11 +2275,9 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
   if (adaptive_changed &&
       !ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
-  ApplyModelLighting(copy, vertex_count, primitive_type, indices, index_count, 0);
   LogZFightSample(caller, "opaque-dip", 1, primitive_type, vertex_count, index_count,
-                  bounds, &adjusted_bounds, adaptive_changed);
-  LogBadDrawCandidate(caller, "opaque-dip", 1, primitive_type, vertex_count, index_count,
-                      profile, bounds, &adjusted_bounds, adaptive_changed);
+                  bounds, &adjusted_bounds,
+                  adaptive_changed);
 
   RunIndexedModelDepthPrepass(self, orig, primitive_type, vertex_type, copy,
                               vertex_count, indices, index_count, flags);
@@ -2745,28 +2316,22 @@ static HRESULT DrawPrimitiveWithTransparentModelDepth(void* self, D3DDevice2Draw
 
   D3DTLVERTEX_COMPAT* copy = NULL;
   void* draw_vertices = vertices;
-  if (g_model_uv_correction || cutout)
+  if (cutout)
   {
     copy = (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
     if (copy)
     {
       memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
-      ApplyModelTexCoordCorrection(copy, vertex_count);
-      if (cutout)
-      {
-        ApplyCutoutGeometryExpansion(copy, vertex_count);
-        DrawBounds adjusted_bounds;
+      DrawBounds adjusted_bounds;
+      ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
+      profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
+      if (profile)
+        InterlockedIncrement(&g_callsite_profile_hits);
+      const DWORD adaptive_changed =
+        ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
+                                           profile, caller, "cutout-dp");
+      if (adaptive_changed)
         ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
-        profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
-        if (profile)
-          InterlockedIncrement(&g_callsite_profile_hits);
-        const DWORD adaptive_changed =
-          ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
-                                             profile, caller, "cutout-dp");
-        LogBadDrawCandidate(caller, "cutout-dp", 0, primitive_type, vertex_count, 0,
-                            profile, bounds, &adjusted_bounds, adaptive_changed);
-      }
-      ApplyModelLighting(copy, vertex_count, primitive_type, NULL, 0, !cutout);
       draw_vertices = copy;
     }
   }
@@ -2814,30 +2379,24 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
 
   D3DTLVERTEX_COMPAT* copy = NULL;
   void* draw_vertices = vertices;
-  if (g_model_uv_correction || cutout)
+  if (cutout)
   {
     copy = (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
     if (copy)
     {
       memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
-      ApplyModelTexCoordCorrection(copy, vertex_count);
-      if (cutout)
-      {
-        ApplyCutoutGeometryExpansion(copy, vertex_count);
-        DrawBounds adjusted_bounds;
-        if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
-          ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
-        profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
-        if (profile)
-          InterlockedIncrement(&g_callsite_profile_hits);
-        const DWORD adaptive_changed =
-          ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
-                                             profile, caller, "cutout-dip");
-        LogBadDrawCandidate(caller, "cutout-dip", 1, primitive_type, vertex_count,
-                            index_count, profile, bounds, &adjusted_bounds,
-                            adaptive_changed);
-      }
-      ApplyModelLighting(copy, vertex_count, primitive_type, indices, index_count, !cutout);
+      DrawBounds adjusted_bounds;
+      if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
+        ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
+      profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
+      if (profile)
+        InterlockedIncrement(&g_callsite_profile_hits);
+      const DWORD adaptive_changed =
+        ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
+                                           profile, caller, "cutout-dip");
+      if (adaptive_changed &&
+          !ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
+        ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       draw_vertices = copy;
     }
   }
@@ -3605,30 +3164,18 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_crow_profile_flat_boost_z_span, g_crow_profile_flat_boost_target_span,
             g_crow_profile_mid_boost_z_span, g_crow_profile_mid_boost_target_span,
             g_crow_profile_precision_snap);
-    LogLine("bad_draw autologger=%d limit=%d tinyZ=%.8f tinyArea=%.1f overRatio=%.2f overAbs=%.8f",
-            g_bad_draw_autologger, g_bad_draw_log_limit, g_bad_draw_tiny_z_span,
-            g_bad_draw_tiny_area, g_bad_draw_over_span_ratio,
-            g_bad_draw_over_shift_abs);
     LogLine("transparent_model zTest=%d zWrite=%d zFunc=%d zBias=%d",
             g_transparent_model_z_test, g_transparent_model_z_write, g_transparent_model_z_func,
             g_transparent_model_z_bias);
-    LogLine("alpha classify cutoutMin=%d hardAlpha=%d/%d cutoutDisableBlend=%d twoSided=%d alphaRef=%lu expand=%d/%.2f",
+    LogLine("alpha classify cutoutMin=%d hardAlpha=%d/%d cutoutDisableBlend=%d twoSided=%d "
+            "alphaRef=%lu",
             g_cutout_alpha_min, g_cutout_hard_alpha_low_max,
             g_cutout_hard_alpha_high_min, g_cutout_model_disable_alpha_blend,
-            g_cutout_model_two_sided, g_cutout_model_alpha_ref,
-            g_cutout_model_screen_expand, g_cutout_model_screen_expand_pixels);
+            g_cutout_model_two_sided, g_cutout_model_alpha_ref);
     LogLine("model_quality perspective=%d alphaTest=%d alphaRef=%lu alphaFunc=%lu "
-            "uvCorrection=%d textureAwareUV=%d uvGrid=%.1f centerGrid=%.1f snapEps=%.4f gouraud=%d dither=%d subpixel=%d",
+            "gouraud=%d dither=%d subpixel=%d",
             g_model_texture_perspective, g_model_alpha_test, g_model_alpha_ref, g_model_alpha_func,
-            g_model_uv_correction, g_model_texture_aware_uv, g_model_uv_snap_grid,
-            g_model_uv_center_grid, g_model_uv_snap_epsilon,
             g_model_gouraud_shading, g_model_dither, g_model_subpixel);
-    LogLine("model_lighting enabled=%d translucent=%d floor=%.1f lift=%.3f gain=%.3f sat=%.3f direct=%.3f rim=%.3f maxBoost=%.1f",
-            g_model_lighting, g_model_lighting_translucent,
-            g_model_lighting_ambient_floor, g_model_lighting_shadow_lift,
-            g_model_lighting_gain, g_model_lighting_saturation,
-            g_model_lighting_direct, g_model_lighting_rim,
-            g_model_lighting_max_luma_boost);
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
   }
   else if (reason == DLL_PROCESS_DETACH)

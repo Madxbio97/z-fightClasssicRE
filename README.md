@@ -1,62 +1,68 @@
 # z-fightClassicRE
 
 ASI plugins for classic PC releases of Resident Evil, Resident Evil 2,
-Resident Evil 3, and Dino Crisis, focused on model depth precision and polygon
-seam cleanup.
+Resident Evil 3, and Dino Crisis. The active scope is intentionally narrow:
+fix model z-fighting and keep the Resident Evil 1 startup disclaimer plugin.
+
+Image smoothing, framebuffer scaling, UV seam cleanup, screen expansion,
+contact-shadow polish, cutout-alpha polish, and other visual experiments are
+not part of the active build.
 
 ## Targets
 
-### Resident Evil 2
-
-- Upgrades requested z-buffer surfaces to 24/32-bit formats when possible.
-- Forces stable z-test/z-write state around accepted 3D model draw calls.
-- Runs an invisible model depth prepass, followed by a color pass with z-write
-  disabled and profile-controlled z-test.
-- Uses texture-aware UV correction for PS1-style model texture seams.
-- Uses callsite profiles and an adaptive depth conflict resolver for flat or
-  near-flat model batches, including the RE2 crow texture profile.
-- Classifies alpha model draws as cutout or translucent: cutout geometry uses
-  alpha test plus depth write, while translucent draws keep z-test without
-  writing depth.
-- Applies conservative vertex-color relighting and small cutout expansion.
-
 ### Resident Evil 1
 
-- Builds as a separate `re1_zfix.asi` target based on the RE2 DirectDraw path.
-- Uses the RE2 model depth prepass/color pass, UV correction, adaptive depth
-  conflict resolver, alpha classification, and vertex-color relighting baseline.
-- Does not require the RE2 model callsite range, so the same geometry filters
-  can work against the different Resident Evil 1 executable.
-- Also hooks the old Direct3D 1 HAL-device execute-buffer path used by some
-  Resident Evil 1 builds, so translucent blob shadows keep z-test discipline.
-- Writes a separate `re1_zfix.log`; tune any future RE1-specific profiles from
-  that log instead of mixing them into the RE2 build.
+- Builds `re1_zfix.asi`.
+- Upgrades requested z-buffer surfaces to higher precision formats when the
+  wrapper/game path allows it.
+- Forces stable z-test/z-write state around accepted model draw calls.
+- Runs an invisible model depth prepass and a color pass with depth writes
+  disabled.
+- Uses model callsite profiles and adaptive depth conflict resolution for flat
+  or near-flat model batches.
+- Keeps the legacy Direct3D 1 execute-buffer hook needed by some RE1 builds for
+  model/shadow depth discipline.
+
+### Resident Evil 2
+
+- Builds `re2_zfix.asi`.
+- Upgrades requested z-buffer surfaces to higher precision formats when
+  possible.
+- Forces stable z-test/z-write state around accepted model draw calls.
+- Runs an invisible model depth prepass and a color pass with depth writes
+  disabled.
+- Uses model callsite profiles and adaptive depth conflict resolution for flat
+  or near-flat model batches.
 
 ### Resident Evil 3 Classic Rebirth
 
-- Hooks the DirectDraw-to-D3D9 path used by Classic Rebirth.
+- Builds `re3_zfix.asi`.
+- Hooks the Classic Rebirth DirectDraw-to-D3D9 path.
 - Creates and binds an owned D3D9 depth-stencil surface when the wrapper does
   not provide a usable one.
+- Clears the owned depth surface at scene boundaries.
 - Forces stable z-test/z-write state around accepted model draw calls.
-- Clears the owned depth surface at the start of each scene.
-- Runs the same model depth prepass/color pass strategy used by the current
-  RE3 build.
-- Uses texture-aware UV correction, alpha cutout/translucent classification,
-  adaptive depth conflict resolution, and conservative vertex-color relighting.
-- Removes old water, shadow, sampler-filter, screen-expansion, CSV tracing, and
-  depth-normalization experiments from the active code path.
+- Runs the model depth prepass/color pass strategy.
+- Uses adaptive depth conflict resolution for model batches.
 
 ### Dino Crisis 1
 
-- Builds as a separate `dc1_zfix.asi` target for the same Classic Rebirth
-  Direct3D9 path used by the RE3 plugin.
-- Uses the model depth prepass/color pass, UV correction, alpha
-  cutout/translucent classification, adaptive depth conflict resolution, and
-  vertex-color relighting baseline.
-- Starts with a generic Dino model profile; tune per-callsite profiles from
-  `dc1_zfix.log` after checking real rooms.
+- Builds `dc1_zfix.asi`.
+- Uses the same Classic Rebirth Direct3D9 depth path as the RE3 plugin.
+- Creates and binds an owned D3D9 depth-stencil surface when needed.
+- Forces stable z-test/z-write state around accepted model draw calls.
+- Runs the model depth prepass/color pass strategy.
+- Uses adaptive depth conflict resolution for model batches.
+
+### Resident Evil 1 Startup Disclaimer
+
+- Builds `re1_startup_disclaimer.asi`.
+- This target is intentionally kept even though it is separate from model
+  z-fighting.
 
 ## Build
+
+Build all active targets:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
@@ -65,8 +71,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Build a single target:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re2
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re1
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re1_disclaimer
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re2
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target re3
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Target dc1
 ```
@@ -81,26 +88,68 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 Outputs:
 
-- `re2_zfix.asi`
 - `re1_zfix.asi`
+- `re1_startup_disclaimer.asi`
+- `re2_zfix.asi`
 - `re3_zfix.asi`
 - `dc1_zfix.asi`
 
-Copy the matching ASI next to the game executable and load it through the
-existing ASI loader.
+## Usage
 
-## Notes
+Use only the plugin that matches the game you are running:
 
-Each plugin writes a compact runtime log next to the game executable:
+- Resident Evil 1: `re1_zfix.asi`
+- Resident Evil 2: `re2_zfix.asi`
+- Resident Evil 3: `re3_zfix.asi`
+- Dino Crisis 1: `dc1_zfix.asi`
 
-- `re2_zfix.log`
+The startup disclaimer is separate: install `re1_startup_disclaimer.asi` only
+when you want that RE1 startup screen behavior.
+
+### Installation
+
+1. Build the required plugin, or use a prebuilt ASI from a release package.
+2. Open the game installation folder.
+3. Copy the matching `.asi` file into the same folder as the game executable.
+4. Make sure the game already has an ASI loader installed. Classic Rebirth and
+   most RE-ENHANCE packages usually include one; otherwise install a compatible
+   ASI loader for the game first.
+5. Start the game normally.
+
+Do not install multiple game-specific zfix plugins into one game folder. Each
+game should only load its own matching ASI.
+
+### Verifying That The Plugin Loaded
+
+After launching the game, check the game folder for the matching log file:
+
 - `re1_zfix.log`
+- `re2_zfix.log`
 - `re3_zfix.log`
 - `dc1_zfix.log`
 
-The RE3 plugin no longer writes `re3_zfix_diag.csv`.
+If the log file appears and contains startup lines, the ASI was loaded. If no
+log file is created, the ASI loader did not load the plugin, the plugin is in
+the wrong folder, or the wrong plugin was copied for that game.
 
-An inventory-entry crash observed during testing produced minidumps whose frame
-chain went through `msvcrt.dll -> bio3hd.asi -> ddraw.dll -> BIOHAZARD(R) 3 PC.exe`.
-`re3_zfix.asi` was loaded, but was not present in that stack chain; the RE3 log
-also showed `depthFail=0` and `ownedDepthFail=0`.
+### Updating Or Removing
+
+To update a fix, close the game and replace the old `.asi` with the new one.
+Keeping a backup such as `re2_zfix.asi.bak` is recommended.
+
+To disable a fix, rename the plugin so it no longer ends with `.asi`, for
+example:
+
+```text
+re2_zfix.asi.disabled
+```
+
+### Troubleshooting
+
+If the game crashes on startup, first remove or rename the plugin and confirm
+the game starts without it. Then check that the correct ASI was installed for
+the correct game.
+
+If models still flicker or show depth artifacts, keep the matching log file and
+test the same scene again. The logs contain draw-call and profile diagnostics
+that can be used to tune a safer per-game or per-model depth profile.
