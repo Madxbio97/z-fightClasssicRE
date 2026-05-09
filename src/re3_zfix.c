@@ -39,6 +39,7 @@
 #define D3DFMT_D32F_LOCKABLE 82
 #define D3DRTYPE_TEXTURE 3
 
+#define ZFIX_LEGACY_HOOK_PATCHING 1
 #include "zfix_common.h"
 #include "zfix_hooks.h"
 #include "zfix_log.h"
@@ -145,6 +146,9 @@ static DWORD g_current_fvf = 0;
 static void* g_current_texture0 = NULL;
 static UINT g_current_texture0_width = 0;
 static UINT g_current_texture0_height = 0;
+static UINT g_backbuffer_width = 640;
+static UINT g_backbuffer_height = 480;
+static DWORD g_backbuffer_format = 0;
 static void* g_owned_depth_device = NULL;
 static void* g_owned_depth_surface = NULL;
 static UINT g_owned_depth_width = 0;
@@ -178,6 +182,7 @@ static volatile LONG g_set_texture_calls = 0;
 static volatile LONG g_set_texture0_changes = 0;
 static volatile LONG g_set_fvf_calls = 0;
 static volatile LONG g_set_render_state_calls = 0;
+static volatile LONG g_2d_depth_bypass_draws = 0;
 
 static const int g_enabled = 1;
 static const int g_upgrade_depth_stencil = 1;
@@ -197,12 +202,15 @@ static const int g_skip_axis_tile_draws = 1;
 static const int g_min_vertex_alpha = 250;
 static const int g_reject_alpha_only_when_blending = 1;
 static const int g_reject_alpha_state_model_draws = 1;
+static const int g_disable_depth_for_2d_layers = 1;
 static const int g_diagnostics = 1;
 static const int g_callsite_profiles_enabled = 1;
 static const int g_adaptive_depth_conflict_resolver = 1;
 static const LONG g_initial_frame_summaries = 3;
 static const LONG g_frame_summary_interval = 300;
 
+static const float g_reference_screen_width = 640.0f;
+static const float g_reference_screen_height = 480.0f;
 static const float g_max_screen_extent = 900.0f;
 static const float g_max_screen_area = 250000.0f;
 static const float g_min_model_rhw = 0.000001f;
@@ -321,6 +329,86 @@ static int PatchVTableSlot(void* obj, int slot, void* hook)
                              &g_hook_count, obj, slot, hook);
 }
 
+static float ClampScale(float scale)
+{
+  if (scale < 0.25f)
+    return 0.25f;
+  if (scale > 8.0f)
+    return 8.0f;
+  return scale;
+}
+
+static float ScreenScaleX(void)
+{
+  if (!g_backbuffer_width)
+    return 1.0f;
+  return ClampScale((float)g_backbuffer_width / g_reference_screen_width);
+}
+
+static float ScreenScaleY(void)
+{
+  if (!g_backbuffer_height)
+    return 1.0f;
+  return ClampScale((float)g_backbuffer_height / g_reference_screen_height);
+}
+
+static float ScreenScaleExtent(void)
+{
+  const float sx = ScreenScaleX();
+  const float sy = ScreenScaleY();
+  return sx > sy ? sx : sy;
+}
+
+static float ScaleScreenExtent(float value)
+{
+  return value * ScreenScaleExtent();
+}
+
+static float ScaleScreenX(float value)
+{
+  return value * ScreenScaleX();
+}
+
+static float ScaleScreenY(float value)
+{
+  return value * ScreenScaleY();
+}
+
+static float ScaleScreenArea(float value)
+{
+  return value * ScreenScaleX() * ScreenScaleY();
+}
+
+static float NormalizeScreenExtent(float value)
+{
+  const float scale = ScreenScaleExtent();
+  return scale > 0.0f ? value / scale : value;
+}
+
+static float NormalizeScreenArea(float value)
+{
+  const float scale = ScreenScaleX() * ScreenScaleY();
+  return scale > 0.0f ? value / scale : value;
+}
+
+static void RememberBackBufferDesc(const D3DSURFACE_DESC_COMPAT* desc)
+{
+  if (!desc || !desc->Width || !desc->Height)
+    return;
+
+  if (g_backbuffer_width != desc->Width ||
+      g_backbuffer_height != desc->Height ||
+      g_backbuffer_format != desc->Format)
+  {
+    g_backbuffer_width = desc->Width;
+    g_backbuffer_height = desc->Height;
+    g_backbuffer_format = desc->Format;
+    LogLine("backbuffer size=%ux%u fmt=%lu scale=%.3fx%.3f",
+            g_backbuffer_width, g_backbuffer_height, g_backbuffer_format,
+            ScreenScaleX(), ScreenScaleY());
+  }
+}
+
 static const ZfixCallsiteProfile* FindModelCallsiteProfile(DWORD caller)
 {
   if (!g_callsite_profiles_enabled)
@@ -340,8 +428,8 @@ static void FillProfileMatchInfo(DWORD caller, const DrawBounds* bounds,
     const float width = AbsF(bounds->width);
     const float height = AbsF(bounds->height);
     info->z_span = bounds->max_z - bounds->min_z;
-    info->area = bounds->area;
-    info->extent = width > height ? width : height;
+    info->area = NormalizeScreenArea(AbsF(bounds->area));
+    info->extent = NormalizeScreenExtent(width > height ? width : height);
   }
   info->texture_handle = (DWORD)(uintptr_t)g_current_texture0;
   info->texture_width = g_current_texture0_width;
@@ -444,6 +532,10 @@ static int GetBackBufferDesc(void* self, D3DSURFACE_DESC_COMPAT* desc)
     const LONG failures = LogCounterIncrement(&g_owned_depth_failures);
     if (failures <= 16)
       LogLine("owned-depth backbuffer desc fail #%ld surface=%p", failures, back_buffer);
+  }
+  else
+  {
+    RememberBackBufferDesc(desc);
   }
   ZfixReleaseComObject(back_buffer);
   return ok;
@@ -707,14 +799,16 @@ static int IsAxisRectInScreenAndUV(const D3D9TLVERTEX* vertices, DWORD vertex_co
 
   const float width = max_x - min_x;
   const float height = max_y - min_y;
-  if (width < 24.0f || height < 24.0f || (max_u - min_u) < 0.0001f || (max_v - min_v) < 0.0001f)
+  if (width < ScaleScreenX(24.0f) || height < ScaleScreenY(24.0f) ||
+      (max_u - min_u) < 0.0001f || (max_v - min_v) < 0.0001f)
     return 0;
 
+  const float xy_epsilon = ScaleScreenExtent(0.05f);
   for (DWORD i = 0; i < vertex_count; i++)
   {
-    if (!NearF(vertices[i].sx, min_x, 0.05f) && !NearF(vertices[i].sx, max_x, 0.05f))
+    if (!NearF(vertices[i].sx, min_x, xy_epsilon) && !NearF(vertices[i].sx, max_x, xy_epsilon))
       return 0;
-    if (!NearF(vertices[i].sy, min_y, 0.05f) && !NearF(vertices[i].sy, max_y, 0.05f))
+    if (!NearF(vertices[i].sy, min_y, xy_epsilon) && !NearF(vertices[i].sy, max_y, xy_epsilon))
       return 0;
     if (!NearF(vertices[i].tu, min_u, 0.0015f) && !NearF(vertices[i].tu, max_u, 0.0015f))
       return 0;
@@ -855,7 +949,8 @@ static int IsSpikeLikeTriangle(const DrawBounds* bounds)
   const float short_extent = width > height ? height : width;
 
   if (g_spike_long_extent > 0.0f && g_spike_thin_extent > 0.0f &&
-      long_extent > g_spike_long_extent && short_extent < g_spike_thin_extent)
+      long_extent > ScaleScreenExtent(g_spike_long_extent) &&
+      short_extent < ScaleScreenExtent(g_spike_thin_extent))
     return 1;
   if (g_max_triangle_aspect > 0.0f && short_extent > 0.0f &&
       (long_extent / short_extent) > g_max_triangle_aspect)
@@ -873,8 +968,9 @@ static int IsFlat2DLayerBounds(const DrawBounds* bounds)
   const int flat_depth = z_span < 0.000010f;
   const int flat_rhw = rhw_span < 0.000010f;
   const int screen_rhw = bounds->min_rhw > 0.95f && bounds->max_rhw < 1.05f;
-  const int large_2d = bounds->width > 256.0f || bounds->height > 256.0f ||
-                       bounds->area > 40000.0f;
+  const int large_2d = AbsF(bounds->width) > ScaleScreenX(256.0f) ||
+                       AbsF(bounds->height) > ScaleScreenY(256.0f) ||
+                       AbsF(bounds->area) > ScaleScreenArea(40000.0f);
 
   if (flat_depth && flat_rhw && screen_rhw)
     return 1;
@@ -882,6 +978,22 @@ static int IsFlat2DLayerBounds(const DrawBounds* bounds)
     return 1;
   if (screen_rhw && large_2d)
     return 1;
+  return 0;
+}
+
+static int ShouldBypassDepthForRejectedDraw(const char* reason, const DrawBounds* bounds)
+{
+  if (!g_disable_depth_for_2d_layers || !reason || !bounds)
+    return 0;
+  if (strcmp(reason, "axis") == 0)
+    return 1;
+  if ((strcmp(reason, "large_extent") == 0 ||
+       strcmp(reason, "large_area") == 0 ||
+       strcmp(reason, "flat") == 0) &&
+      IsFlat2DLayerBounds(bounds))
+  {
+    return 1;
+  }
   return 0;
 }
 
@@ -926,13 +1038,14 @@ static int IsModelDepthDraw(const D3D9TLVERTEX* vertices, DWORD primitive_type, 
   }
 
   if (g_max_screen_extent > 0.0f &&
-      (local_bounds.width > g_max_screen_extent || local_bounds.height > g_max_screen_extent))
+      (local_bounds.width > ScaleScreenX(g_max_screen_extent) ||
+       local_bounds.height > ScaleScreenY(g_max_screen_extent)))
   {
     if (reason)
       *reason = "large_extent";
     return 0;
   }
-  if (g_max_screen_area > 0.0f && local_bounds.area > g_max_screen_area)
+  if (g_max_screen_area > 0.0f && local_bounds.area > ScaleScreenArea(g_max_screen_area))
   {
     if (reason)
       *reason = "large_area";
@@ -984,14 +1097,14 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3D9TLVERTEX* vertices, DWORD ve
   const float height = AbsF(bounds->height);
   const float extent = width > height ? width : height;
   const int aggressive = ZfixProfileIsAggressive(profile);
-  const float min_area = ZfixFloatOrDefault(profile ? profile->min_area : 0.0f,
-                                            g_adaptive_depth_min_area);
-  const float max_area = ZfixFloatOrDefault(profile ? profile->max_area : 0.0f,
-                                            g_adaptive_depth_max_area);
-  const float min_extent = ZfixFloatOrDefault(profile ? profile->min_extent : 0.0f,
-                                              g_adaptive_depth_min_extent);
-  const float max_extent = ZfixFloatOrDefault(profile ? profile->max_extent : 0.0f,
-                                              g_adaptive_depth_max_extent);
+  const float min_area = ScaleScreenArea(ZfixFloatOrDefault(profile ? profile->min_area : 0.0f,
+                                                            g_adaptive_depth_min_area));
+  const float max_area = ScaleScreenArea(ZfixFloatOrDefault(profile ? profile->max_area : 0.0f,
+                                                            g_adaptive_depth_max_area));
+  const float min_extent = ScaleScreenExtent(ZfixFloatOrDefault(profile ? profile->min_extent : 0.0f,
+                                                                g_adaptive_depth_min_extent));
+  const float max_extent = ScaleScreenExtent(ZfixFloatOrDefault(profile ? profile->max_extent : 0.0f,
+                                                                g_adaptive_depth_max_extent));
 
   const int below_profile_floor = bounds->area < min_area || extent < min_extent;
   const int small_normal = !aggressive && below_profile_floor;
@@ -1000,12 +1113,12 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3D9TLVERTEX* vertices, DWORD ve
   if (below_profile_floor && !small_normal)
     return 0;
   if (small_normal &&
-      (bounds->area < g_adaptive_depth_small_min_area ||
-       extent < g_adaptive_depth_small_min_extent))
+      (bounds->area < ScaleScreenArea(g_adaptive_depth_small_min_area) ||
+       extent < ScaleScreenExtent(g_adaptive_depth_small_min_extent)))
     return 0;
   if (!aggressive && !small_normal &&
-      (bounds->area < g_adaptive_depth_normal_min_area ||
-       extent < g_adaptive_depth_normal_min_extent))
+      (bounds->area < ScaleScreenArea(g_adaptive_depth_normal_min_area) ||
+       extent < ScaleScreenExtent(g_adaptive_depth_normal_min_extent)))
     return 0;
 
   const float z_span = bounds->max_z - bounds->min_z;
@@ -1072,14 +1185,14 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3D9TLVERTEX* vertices, DWORD ve
     source_min = bounds->min_rhw;
     source_span = rhw_span;
   }
-  else if (width >= height && width > g_adaptive_depth_axis_signal)
+  else if (width >= height && width > ScaleScreenExtent(g_adaptive_depth_axis_signal))
   {
     mode = ADAPTIVE_BY_X;
     mode_name = "x";
     source_min = bounds->min_x;
     source_span = width;
   }
-  else if (height > g_adaptive_depth_axis_signal)
+  else if (height > ScaleScreenExtent(g_adaptive_depth_axis_signal))
   {
     mode = ADAPTIVE_BY_Y;
     mode_name = "y";
@@ -1205,6 +1318,67 @@ static void RestoreState(void* self, const D3D9StateSnapshot* snapshot)
     SetOneRenderState(self, D3DRS_SHADEMODE, snapshot->shade_mode);
   if (snapshot->has_dither_enable)
     SetOneRenderState(self, D3DRS_DITHERENABLE, snapshot->dither_enable);
+}
+
+static void DisableDepthFor2DLayer(void* self, const D3D9StateSnapshot* snapshot)
+{
+  if (snapshot->has_z_enable)
+    SetOneRenderState(self, D3DRS_ZENABLE, 0);
+  if (snapshot->has_z_write)
+    SetOneRenderState(self, D3DRS_ZWRITEENABLE, 0);
+}
+
+static HRESULT DrawPrimitiveUPWithoutDepth(void* self, D3D9DrawPrimitiveUPProc orig,
+                                           DWORD primitive_type, UINT primitive_count,
+                                           const void* vertex_data, UINT vertex_stride,
+                                           const char* reason, const DrawBounds* bounds)
+{
+  D3D9StateSnapshot snapshot;
+  CaptureState(self, &snapshot);
+  DisableDepthFor2DLayer(self, &snapshot);
+  HRESULT hr = orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
+  RestoreState(self, &snapshot);
+
+  const LONG bypassed = LogCounterIncrement(&g_2d_depth_bypass_draws);
+  if (bypassed <= 32)
+  {
+    LogLine("2d-depth-bypass #%ld dpup reason=%s z=[%.6f..%.6f] rhw=[%.8f..%.8f] "
+            "xy=[%.2f..%.2f %.2f..%.2f]",
+            bypassed, reason ? reason : "unknown",
+            bounds ? bounds->min_z : 0.0f, bounds ? bounds->max_z : 0.0f,
+            bounds ? bounds->min_rhw : 0.0f, bounds ? bounds->max_rhw : 0.0f,
+            bounds ? bounds->min_x : 0.0f, bounds ? bounds->max_x : 0.0f,
+            bounds ? bounds->min_y : 0.0f, bounds ? bounds->max_y : 0.0f);
+  }
+  return hr;
+}
+
+static HRESULT DrawIndexedPrimitiveUPWithoutDepth(void* self, D3D9DrawIndexedPrimitiveUPProc orig,
+                                                  DWORD primitive_type, UINT min_vertex_index,
+                                                  UINT num_vertices, UINT primitive_count,
+                                                  const void* index_data, DWORD index_format,
+                                                  const void* vertex_data, UINT vertex_stride,
+                                                  const char* reason, const DrawBounds* bounds)
+{
+  D3D9StateSnapshot snapshot;
+  CaptureState(self, &snapshot);
+  DisableDepthFor2DLayer(self, &snapshot);
+  HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
+                    index_data, index_format, vertex_data, vertex_stride);
+  RestoreState(self, &snapshot);
+
+  const LONG bypassed = LogCounterIncrement(&g_2d_depth_bypass_draws);
+  if (bypassed <= 32)
+  {
+    LogLine("2d-depth-bypass #%ld dipup reason=%s z=[%.6f..%.6f] rhw=[%.8f..%.8f] "
+            "xy=[%.2f..%.2f %.2f..%.2f]",
+            bypassed, reason ? reason : "unknown",
+            bounds ? bounds->min_z : 0.0f, bounds ? bounds->max_z : 0.0f,
+            bounds ? bounds->min_rhw : 0.0f, bounds ? bounds->max_rhw : 0.0f,
+            bounds ? bounds->min_x : 0.0f, bounds ? bounds->max_x : 0.0f,
+            bounds ? bounds->min_y : 0.0f, bounds ? bounds->max_y : 0.0f);
+  }
+  return hr;
 }
 
 static void ForceModelDepthPrepassState(void* self, const D3D9StateSnapshot* snapshot)
@@ -1431,6 +1605,11 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawPrimitiveUP(void* self, DWORD pri
       LogCounterIncrement(&g_dpup_rhw_rejected);
     else
       LogCounterIncrement(&g_dpup_other_rejected);
+    if (ShouldBypassDepthForRejectedDraw(reason, &bounds))
+    {
+      return DrawPrimitiveUPWithoutDepth(self, orig, primitive_type, primitive_count,
+                                         vertex_data, vertex_stride, reason, &bounds);
+    }
     return orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
   }
 
@@ -1548,6 +1727,14 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   {
     LogCounterIncrement(&g_dipup_rejected);
     ZfixReleaseCopyBuffer(indexed, indexed_heap);
+    if (ShouldBypassDepthForRejectedDraw(reason, &bounds))
+    {
+      return DrawIndexedPrimitiveUPWithoutDepth(self, orig, primitive_type,
+                                               min_vertex_index, num_vertices,
+                                               primitive_count, index_data,
+                                               index_format, vertex_data,
+                                               vertex_stride, reason, &bounds);
+    }
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
   }
@@ -1614,7 +1801,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
               "profiles=%ld adaptive=%ld/%ld "
               "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
               "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p wh=%ux%u curFVF=0x%lX "
-              "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
+              "bb=%ux%u scale=%.3fx%.3f ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld bypass2d=%ld",
               frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
               g_dipup_total, g_dipup_accepted,
               g_dipup_rejected, g_model_depth_prepass_draws, g_model_depth_prepass_failures,
@@ -1625,7 +1812,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
               g_set_texture_calls, g_set_texture0_changes, g_set_fvf_calls,
               g_set_render_state_calls, g_current_texture0,
               g_current_texture0_width, g_current_texture0_height, g_current_fvf,
-              g_owned_depth_creates, g_owned_depth_sets, g_owned_depth_failures);
+              g_backbuffer_width, g_backbuffer_height, ScreenScaleX(), ScreenScaleY(),
+              g_owned_depth_creates, g_owned_depth_sets, g_owned_depth_failures,
+              g_2d_depth_bypass_draws);
     }
   }
   g_scene_open = 0;
@@ -1771,6 +1960,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     LogLine("depth prepass=%d colorZWrite=%d colorZFunc=%d",
             g_model_depth_prepass, g_model_color_pass_z_write,
             g_model_color_pass_z_func);
+    LogLine("screen scaling reference=%.0fx%.0f initial=%ux%u",
+            g_reference_screen_width, g_reference_screen_height,
+            g_backbuffer_width, g_backbuffer_height);
     LogLine("profiles enabled=%d count=%lu adaptiveDepth=%d flatSpan=%.8f targetSpan=%.8f "
             "maxSpan=%.8f maxShift=%.8f area=%.1f..%.1f extent=%.1f..%.1f "
             "small=%.1f/%.1f strength=%.2f",
@@ -1782,6 +1974,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
             g_adaptive_depth_max_extent, g_adaptive_depth_small_min_area,
             g_adaptive_depth_small_min_extent, g_adaptive_depth_small_strength);
     LogLine("alpha bypass stateReject=%d", g_reject_alpha_state_model_draws);
+    LogLine("2d depth bypass=%d", g_disable_depth_for_2d_layers);
     PatchAllImports();
   }
   return TRUE;

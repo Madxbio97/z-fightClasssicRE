@@ -3,12 +3,20 @@
 
 #include <windows.h>
 #include <string.h>
+#include <tlhelp32.h>
+
+#define ZFIX_IMPORT_REPATCH_PASSES 20u
+#define ZFIX_IMPORT_REPATCH_DELAY_MS 250u
 
 typedef struct HookEntry {
   void** vtable;
   int slot;
   void* original;
 } HookEntry;
+
+typedef int (*ZfixModulePatchProc)(HMODULE module);
+typedef int (*ZfixImportPatchPassProc)(void);
+typedef void (*ZfixImportPatchLogProc)(DWORD pass, int patched);
 
 static inline void* GetVTableSlot(void* obj, int slot)
 {
@@ -77,8 +85,34 @@ static inline int ZfixPatchVTableSlot(HookEntry* hooks, LONG hook_capacity,
   {
     if (hooks[i].vtable == vtable && hooks[i].slot == slot)
     {
+#ifdef ZFIX_LEGACY_HOOK_PATCHING
       result = 1;
       goto done;
+#else
+      if (vtable[slot] == hook)
+      {
+        result = 1;
+        goto done;
+      }
+      if (vtable[slot] != hooks[i].original)
+      {
+        /* Another hook owns the slot now. Leave it in place so chained hooks
+           can keep working instead of fighting for the top of the vtable. */
+        result = 0;
+        goto done;
+      }
+
+      DWORD old_protect = 0;
+      if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect))
+        goto done;
+
+      vtable[slot] = hook;
+      DWORD ignored = 0;
+      VirtualProtect(&vtable[slot], sizeof(void*), old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), &vtable[slot], sizeof(void*));
+      result = 1;
+      goto done;
+#endif
     }
   }
 
@@ -126,6 +160,24 @@ static inline void* ZfixRvaToPtr(BYTE* module, DWORD rva)
   return (module && rva) ? (void*)(module + rva) : NULL;
 }
 
+static inline int ZfixAddressInModule(HMODULE module, const void* address)
+{
+  if (!module || !address)
+    return 0;
+
+  BYTE* base = (BYTE*)module;
+  IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+    return 0;
+
+  IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return 0;
+
+  const BYTE* ptr = (const BYTE*)address;
+  return ptr >= base && ptr < (base + nt->OptionalHeader.SizeOfImage);
+}
+
 static inline int ZfixPatchModuleImport(HMODULE module, const char* dll_name,
                                         const char* proc_name, void* hook,
                                         void** original)
@@ -158,6 +210,9 @@ static inline int ZfixPatchModuleImport(HMODULE module, const char* dll_name,
   int patched = 0;
   IMAGE_IMPORT_DESCRIPTOR* desc =
     (IMAGE_IMPORT_DESCRIPTOR*)ZfixRvaToPtr(base, dir.VirtualAddress);
+#ifndef ZFIX_LEGACY_HOOK_PATCHING
+  HMODULE imported_module = GetModuleHandleA(dll_name);
+#endif
   for (; desc && desc->Name; desc++)
   {
     const char* imported_dll = (const char*)ZfixRvaToPtr(base, desc->Name);
@@ -184,6 +239,15 @@ static inline int ZfixPatchModuleImport(HMODULE module, const char* dll_name,
       void** target = (void**)&thunk->u1.Function;
       if (*target == hook)
         continue;
+#ifndef ZFIX_LEGACY_HOOK_PATCHING
+      if (original && *original && *target != *original &&
+          !ZfixAddressInModule(imported_module, *target))
+      {
+        /* The import already points at a third-party hook. Do not overwrite it
+           after our original target has been established. */
+        continue;
+      }
+#endif
       if (original && !*original)
         *original = *target;
 
@@ -199,6 +263,59 @@ static inline int ZfixPatchModuleImport(HMODULE module, const char* dll_name,
     }
   }
   return patched;
+}
+
+static inline int ZfixPatchLoadedModules(ZfixModulePatchProc patch_module)
+{
+  if (!patch_module)
+    return 0;
+
+  int patched = 0;
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snap == INVALID_HANDLE_VALUE)
+    return patch_module(GetModuleHandleA(NULL));
+
+  MODULEENTRY32 me;
+  memset(&me, 0, sizeof(me));
+  me.dwSize = sizeof(me);
+  if (Module32First(snap, &me))
+  {
+    do
+    {
+      patched += patch_module(me.hModule);
+    } while (Module32Next(snap, &me));
+  }
+  CloseHandle(snap);
+  return patched;
+}
+
+static inline void ZfixRunDelayedImportPatches(ZfixImportPatchPassProc patch_all,
+                                               DWORD passes, DWORD delay_ms,
+                                               ZfixImportPatchLogProc log_patch)
+{
+  if (!patch_all)
+    return;
+
+  for (DWORD i = 0; i < passes; i++)
+  {
+    Sleep(delay_ms);
+    const int patched = patch_all();
+    if (patched && log_patch)
+      log_patch(i + 1, patched);
+  }
+}
+
+static inline int ZfixStartDetachedThread(LPTHREAD_START_ROUTINE proc, void* param)
+{
+  if (!proc)
+    return 0;
+
+  HANDLE worker = CreateThread(NULL, 0, proc, param, 0, NULL);
+  if (!worker)
+    return 0;
+
+  CloseHandle(worker);
+  return 1;
 }
 
 #endif
