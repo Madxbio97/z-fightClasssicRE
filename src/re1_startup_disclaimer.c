@@ -127,6 +127,12 @@ typedef struct StartupDisclaimerFrameBuffer {
 typedef HRESULT(WINAPI* DirectDrawCreateProc)(GUID* lpGUID, void** lplpDD, void* pUnkOuter);
 typedef HRESULT(STDMETHODCALLTYPE* DirectDrawCreateSurfaceProc)(void* self, DDSURFACEDESC_COMPAT* desc,
                                                                 void** surface, void* outer);
+typedef HRESULT(STDMETHODCALLTYPE* DirectDrawSetDisplayModeProc)(void* self, DWORD width,
+                                                                 DWORD height, DWORD bpp);
+typedef HRESULT(STDMETHODCALLTYPE* DirectDraw2SetDisplayModeProc)(void* self, DWORD width,
+                                                                  DWORD height, DWORD bpp,
+                                                                  DWORD refresh_rate,
+                                                                  DWORD flags);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltProc)(void* self, RECT* dst, void* src, RECT* src_rect,
                                                      DWORD flags, void* fx);
 typedef HRESULT(STDMETHODCALLTYPE* DDSurfaceBltFastProc)(void* self, DWORD x, DWORD y, void* src,
@@ -172,6 +178,10 @@ static volatile LONG g_action_key_count = 0;
 static volatile LONG g_action_button_count = 0;
 static volatile LONG g_surface_seen = 0;
 static volatile LONG g_surface_patched = 0;
+static volatile LONG g_display_mode_changes = 0;
+static volatile LONG g_display_mode_width = 0;
+static volatile LONG g_display_mode_height = 0;
+static volatile LONG g_display_mode_bpp = 0;
 static volatile LONG g_draws = 0;
 static volatile LONG g_presents = 0;
 static volatile LONG g_hold_done = 0;
@@ -181,12 +191,19 @@ static volatile LONG g_failure_logged = 0;
 
 static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC_COMPAT* desc,
                                                        void** surface, void* outer);
+static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width, DWORD height,
+                                                        DWORD bpp);
+static HRESULT STDMETHODCALLTYPE Hook_DD2_SetDisplayMode(void* self, DWORD width, DWORD height,
+                                                         DWORD bpp, DWORD refresh_rate,
+                                                         DWORD flags);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Blt(void* self, RECT* dst, void* src, RECT* src_rect,
                                                     DWORD flags, void* fx);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_BltFast(void* self, DWORD x, DWORD y, void* src,
                                                         RECT* src_rect, DWORD trans);
 static HRESULT STDMETHODCALLTYPE Hook_DDSurface_Flip(void* self, void* target_override, DWORD flags);
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj);
+static void ReleaseFrameBuffer(void);
+static void LogLine(const char* fmt, ...);
 static int DrawDisclaimer(void* surface, const char* reason, int present_event);
 
 static void* GetOriginal(void** vtable, int slot)
@@ -198,6 +215,30 @@ static int PatchVTableSlot(void* obj, int slot, void* hook)
 {
   return ZfixPatchVTableSlot(g_hooks, (LONG)ARRAYSIZE(g_hooks),
                              &g_hook_count, obj, slot, hook);
+}
+
+static int ValidDisplayExtent(DWORD width, DWORD height)
+{
+  return width > 0 && height > 0 && width <= 8192 && height <= 8192;
+}
+
+static void RememberDisplayMode(DWORD width, DWORD height, DWORD bpp,
+                                const char* reason)
+{
+  if (!ValidDisplayExtent(width, height))
+    return;
+
+  const LONG old_w = InterlockedExchange(&g_display_mode_width, (LONG)width);
+  const LONG old_h = InterlockedExchange(&g_display_mode_height, (LONG)height);
+  InterlockedExchange(&g_display_mode_bpp, (LONG)bpp);
+  const LONG changes = InterlockedIncrement(&g_display_mode_changes);
+
+  if (old_w != (LONG)width || old_h != (LONG)height)
+  {
+    ReleaseFrameBuffer();
+    LogLine("startup disclaimer display mode #%ld via=%s wh=%lux%lu bpp=%lu old=%ldx%ld",
+            changes, reason ? reason : "unknown", width, height, bpp, old_w, old_h);
+  }
 }
 
 static void BuildLogPath(HINSTANCE instance)
@@ -810,6 +851,61 @@ static int IsDisclaimerSurfaceDesc(const DDSURFACEDESC_COMPAT* desc)
   return (caps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)) != 0;
 }
 
+static int RectWidth(const RECT* rect)
+{
+  return rect ? (int)(rect->right - rect->left) : 0;
+}
+
+static int RectHeight(const RECT* rect)
+{
+  return rect ? (int)(rect->bottom - rect->top) : 0;
+}
+
+static int ResolveDisclaimerSurfaceSize(HDC dc, const DDSURFACEDESC_COMPAT* desc,
+                                        int* out_width, int* out_height)
+{
+  if (!dc || !desc || !out_width || !out_height)
+    return 0;
+
+  int width = (int)desc->dwWidth;
+  int height = (int)desc->dwHeight;
+  if (!ValidDisplayExtent((DWORD)width, (DWORD)height))
+  {
+    width = GetDeviceCaps(dc, HORZRES);
+    height = GetDeviceCaps(dc, VERTRES);
+  }
+
+  const LONG mode_w = g_display_mode_width;
+  const LONG mode_h = g_display_mode_height;
+  if (ValidDisplayExtent((DWORD)mode_w, (DWORD)mode_h))
+  {
+    width = (int)mode_w;
+    height = (int)mode_h;
+  }
+
+  RECT clip;
+  memset(&clip, 0, sizeof(clip));
+  const int clip_type = GetClipBox(dc, &clip);
+  const int clip_w = RectWidth(&clip);
+  const int clip_h = RectHeight(&clip);
+  if (clip_type != ERROR && ValidDisplayExtent((DWORD)clip_w, (DWORD)clip_h))
+  {
+    const int mode_valid = ValidDisplayExtent((DWORD)mode_w, (DWORD)mode_h);
+    if (!mode_valid || ((int64_t)clip_w * clip_h) > ((int64_t)width * height))
+    {
+      width = clip_w;
+      height = clip_h;
+    }
+  }
+
+  if (!ValidDisplayExtent((DWORD)width, (DWORD)height))
+    return 0;
+
+  *out_width = width;
+  *out_height = height;
+  return 1;
+}
+
 static void RetireDisclaimer(const char* reason, DWORD elapsed_ms)
 {
   if (InterlockedCompareExchange(&g_retired, 1, 0) == 0)
@@ -969,13 +1065,9 @@ static int DrawDisclaimer(void* surface, const char* reason, int present_event)
     return 0;
   }
 
-  int surface_w = (int)desc.dwWidth;
-  int surface_h = (int)desc.dwHeight;
-  if (surface_w <= 0)
-    surface_w = GetDeviceCaps(dc, HORZRES);
-  if (surface_h <= 0)
-    surface_h = GetDeviceCaps(dc, VERTRES);
-  if (surface_w <= 0 || surface_h <= 0)
+  int surface_w = 0;
+  int surface_h = 0;
+  if (!ResolveDisclaimerSurfaceSize(dc, &desc, &surface_w, &surface_h))
   {
     release_dc(surface, dc);
     return 0;
@@ -1135,6 +1227,35 @@ static HRESULT STDMETHODCALLTYPE Hook_DD_CreateSurface(void* self, DDSURFACEDESC
   return hr;
 }
 
+static HRESULT STDMETHODCALLTYPE Hook_DD_SetDisplayMode(void* self, DWORD width, DWORD height,
+                                                        DWORD bpp)
+{
+  DirectDrawSetDisplayModeProc orig =
+    (DirectDrawSetDisplayModeProc)GetOriginal(*(void***)self, 21);
+  if (!orig)
+    return E_FAIL;
+
+  HRESULT hr = orig(self, width, height, bpp);
+  if (SUCCEEDED(hr))
+    RememberDisplayMode(width, height, bpp, "SetDisplayMode");
+  return hr;
+}
+
+static HRESULT STDMETHODCALLTYPE Hook_DD2_SetDisplayMode(void* self, DWORD width, DWORD height,
+                                                         DWORD bpp, DWORD refresh_rate,
+                                                         DWORD flags)
+{
+  DirectDraw2SetDisplayModeProc orig =
+    (DirectDraw2SetDisplayModeProc)GetOriginal(*(void***)self, 21);
+  if (!orig)
+    return E_FAIL;
+
+  HRESULT hr = orig(self, width, height, bpp, refresh_rate, flags);
+  if (SUCCEEDED(hr))
+    RememberDisplayMode(width, height, bpp, "SetDisplayMode");
+  return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, void** ppvObj)
 {
   QueryInterfaceProc orig = (QueryInterfaceProc)GetOriginal(*(void***)self, 0);
@@ -1146,7 +1267,10 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
   {
     PatchVTableSlot(*ppvObj, 0, (void*)Hook_QueryInterface);
     if (IsGuid(riid, &kIID_IDirectDraw2))
+    {
       PatchVTableSlot(*ppvObj, 6, (void*)Hook_DD_CreateSurface);
+      PatchVTableSlot(*ppvObj, 21, (void*)Hook_DD2_SetDisplayMode);
+    }
   }
 
   return hr;
@@ -1162,6 +1286,7 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   {
     PatchVTableSlot(*lplpDD, 0, (void*)Hook_QueryInterface);
     PatchVTableSlot(*lplpDD, 6, (void*)Hook_DD_CreateSurface);
+    PatchVTableSlot(*lplpDD, 21, (void*)Hook_DD_SetDisplayMode);
   }
 
   return hr;
@@ -1256,9 +1381,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   else if (reason == DLL_PROCESS_DETACH)
   {
     LogLine("startup disclaimer summary loadState=%ld surfaces=%ld patched=%ld "
-            "draws=%ld presents=%ld hold=%ld retired=%ld",
+            "draws=%ld presents=%ld hold=%ld retired=%ld displayMode=%ld %ldx%ldx%ld",
             g_load_state, g_surface_seen, g_surface_patched,
-            g_draws, g_presents, g_hold_done, g_retired);
+            g_draws, g_presents, g_hold_done, g_retired,
+            g_display_mode_changes, g_display_mode_width,
+            g_display_mode_height, g_display_mode_bpp);
     if (!reserved)
     {
       ReleaseImage();
