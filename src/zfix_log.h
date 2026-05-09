@@ -6,6 +6,16 @@
 #include <stdio.h>
 #include <string.h>
 
+static inline LONG ZfixLogCounterIncrement(int enabled, volatile LONG* counter)
+{
+  return (enabled && counter) ? InterlockedIncrement(counter) : 0;
+}
+
+static inline LONG ZfixLogCounterAdd(int enabled, volatile LONG* counter, LONG value)
+{
+  return (enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
+}
+
 static inline const char* ZfixBaseNameFromPath(const char* path)
 {
   const char* base = path;

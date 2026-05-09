@@ -222,7 +222,6 @@ typedef HRESULT(STDMETHODCALLTYPE* D3DDevice2DrawIndexedPrimitiveProc)(void* sel
                                                                        DWORD index_count, DWORD flags);
 typedef HRESULT(STDMETHODCALLTYPE* D3DTextureGetHandleProc)(void* self, void* device, DWORD* handle);
 typedef HRESULT(STDMETHODCALLTYPE* D3DTexture2GetHandleProc)(void* self, void* device, DWORD* handle);
-typedef ULONG(STDMETHODCALLTYPE* ComReleaseProc)(void* self);
 typedef HRESULT(STDMETHODCALLTYPE* D3DViewport2ClearProc)(void* self, DWORD count, void* rects, DWORD flags);
 
 static const GUID kIID_IDirectDraw2 =
@@ -711,12 +710,12 @@ static void LogLine(const char* fmt, ...)
 
 static LONG LogCounterIncrement(volatile LONG* counter)
 {
-  return (g_log_enabled && counter) ? InterlockedIncrement(counter) : 0;
+  return ZfixLogCounterIncrement(g_log_enabled, counter);
 }
 
 static LONG LogCounterAdd(volatile LONG* counter, LONG value)
 {
-  return (g_log_enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
+  return ZfixLogCounterAdd(g_log_enabled, counter, value);
 }
 
 static void ResolveModuleForAddress(DWORD address, ModuleAddressInfo* info)
@@ -746,6 +745,7 @@ static DrawCallsiteStats* FindOrCreateDrawCallsite(DWORD caller)
   if (!g_log_enabled || !g_callsite_diagnostics || !caller)
     return NULL;
 
+  static volatile LONG callsite_lock = 0;
   LONG count = g_draw_callsite_count;
   if (count > (LONG)ARRAYSIZE(g_draw_callsites))
     count = (LONG)ARRAYSIZE(g_draw_callsites);
@@ -755,14 +755,32 @@ static DrawCallsiteStats* FindOrCreateDrawCallsite(DWORD caller)
       return &g_draw_callsites[i];
   }
 
-  LONG index = InterlockedIncrement(&g_draw_callsite_count) - 1;
-  if (index < 0 || index >= (LONG)ARRAYSIZE(g_draw_callsites))
+  ZfixAcquirePatchLock(&callsite_lock);
+  count = g_draw_callsite_count;
+  if (count < 0)
+    count = 0;
+  if (count > (LONG)ARRAYSIZE(g_draw_callsites))
+    count = (LONG)ARRAYSIZE(g_draw_callsites);
+  for (LONG i = 0; i < count; i++)
+  {
+    if (g_draw_callsites[i].caller == caller)
+    {
+      ZfixReleasePatchLock(&callsite_lock);
+      return &g_draw_callsites[i];
+    }
+  }
+  if (count >= (LONG)ARRAYSIZE(g_draw_callsites))
+  {
+    ZfixReleasePatchLock(&callsite_lock);
     return NULL;
+  }
 
-  DrawCallsiteStats* site = &g_draw_callsites[index];
+  DrawCallsiteStats* site = &g_draw_callsites[count];
   memset(site, 0, sizeof(*site));
   site->caller = caller;
   ResolveModuleForAddress(caller, &site->address);
+  InterlockedExchange(&g_draw_callsite_count, count + 1);
+  ZfixReleasePatchLock(&callsite_lock);
   return site;
 }
 
@@ -2208,11 +2226,9 @@ static void ClearDepthBuffer(void* self)
 
   void** vt = *(void***)viewport;
   D3DViewport2ClearProc clear = vt ? (D3DViewport2ClearProc)vt[12] : NULL;
-  ComReleaseProc release = vt ? (ComReleaseProc)vt[2] : NULL;
   if (clear)
     clear(viewport, 0, NULL, D3DCLEAR_ZBUFFER);
-  if (release)
-    release(viewport);
+  ZfixReleaseComObject(viewport);
 }
 
 static void ClearDepthBufferForScene(void* self)
@@ -2368,8 +2384,18 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
   ForceDepthStateForDraw(self);
   ForceModelQualityStateForDraw(self, &snapshot);
 
+  D3DTLVERTEX_COMPAT stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  SIZE_T copy_bytes = 0;
+  if (!ZfixCheckedSizeMul(sizeof(stack_copy[0]), (SIZE_T)vertex_count, &copy_bytes))
+  {
+    HRESULT hr = orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
+    RestoreDepthStateForDraw(self, &snapshot);
+    return hr;
+  }
+
+  int heap_copy = 0;
   D3DTLVERTEX_COMPAT* copy =
-    (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+    (D3DTLVERTEX_COMPAT*)ZfixAcquireCopyBuffer(copy_bytes, stack_copy, sizeof(stack_copy), &heap_copy);
   if (!copy)
   {
     HRESULT hr = orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
@@ -2377,7 +2403,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
     return hr;
   }
 
-  memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+  memcpy(copy, vertices, copy_bytes);
   DrawBounds adjusted_bounds;
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
@@ -2399,7 +2425,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
     ForceModelColorPassAfterPrepassState(self, profile);
   HRESULT hr = orig(self, primitive_type, vertex_type, copy, vertex_count, flags);
   RestoreDepthStateForDraw(self, &snapshot);
-  HeapFree(GetProcessHeap(), 0, copy);
+  ZfixReleaseCopyBuffer(copy, heap_copy);
   g_model_depth_written_this_scene = 1;
   return hr;
 }
@@ -2416,8 +2442,18 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
   ForceDepthStateForDraw(self);
   ForceModelQualityStateForDraw(self, &snapshot);
 
+  D3DTLVERTEX_COMPAT stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  SIZE_T copy_bytes = 0;
+  if (!ZfixCheckedSizeMul(sizeof(stack_copy[0]), (SIZE_T)vertex_count, &copy_bytes))
+  {
+    HRESULT hr = orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
+    RestoreDepthStateForDraw(self, &snapshot);
+    return hr;
+  }
+
+  int heap_copy = 0;
   D3DTLVERTEX_COMPAT* copy =
-    (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+    (D3DTLVERTEX_COMPAT*)ZfixAcquireCopyBuffer(copy_bytes, stack_copy, sizeof(stack_copy), &heap_copy);
   if (!copy)
   {
     HRESULT hr = orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
@@ -2425,7 +2461,7 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
     return hr;
   }
 
-  memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+  memcpy(copy, vertices, copy_bytes);
   DrawBounds adjusted_bounds;
   if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
@@ -2450,7 +2486,7 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
     ForceModelColorPassAfterPrepassState(self, profile);
   HRESULT hr = orig(self, primitive_type, vertex_type, copy, vertex_count, indices, index_count, flags);
   RestoreDepthStateForDraw(self, &snapshot);
-  HeapFree(GetProcessHeap(), 0, copy);
+  ZfixReleaseCopyBuffer(copy, heap_copy);
   g_model_depth_written_this_scene = 1;
   return hr;
 }
@@ -2479,12 +2515,16 @@ static HRESULT DrawPrimitiveWithTransparentModelDepth(void* self, D3DDevice2Draw
 
   D3DTLVERTEX_COMPAT* copy = NULL;
   void* draw_vertices = vertices;
+  D3DTLVERTEX_COMPAT stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  int heap_copy = 0;
   if (cutout)
   {
-    copy = (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+    SIZE_T copy_bytes = 0;
+    if (ZfixCheckedSizeMul(sizeof(stack_copy[0]), (SIZE_T)vertex_count, &copy_bytes))
+      copy = (D3DTLVERTEX_COMPAT*)ZfixAcquireCopyBuffer(copy_bytes, stack_copy, sizeof(stack_copy), &heap_copy);
     if (copy)
     {
-      memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+      memcpy(copy, vertices, copy_bytes);
       DrawBounds adjusted_bounds;
       ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
@@ -2513,7 +2553,7 @@ static HRESULT DrawPrimitiveWithTransparentModelDepth(void* self, D3DDevice2Draw
   HRESULT hr = orig(self, primitive_type, vertex_type, draw_vertices, vertex_count, flags);
   RestoreDepthStateForDraw(self, &snapshot);
   if (copy)
-    HeapFree(GetProcessHeap(), 0, copy);
+    ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -2542,12 +2582,16 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
 
   D3DTLVERTEX_COMPAT* copy = NULL;
   void* draw_vertices = vertices;
+  D3DTLVERTEX_COMPAT stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  int heap_copy = 0;
   if (cutout)
   {
-    copy = (D3DTLVERTEX_COMPAT*)HeapAlloc(GetProcessHeap(), 0, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+    SIZE_T copy_bytes = 0;
+    if (ZfixCheckedSizeMul(sizeof(stack_copy[0]), (SIZE_T)vertex_count, &copy_bytes))
+      copy = (D3DTLVERTEX_COMPAT*)ZfixAcquireCopyBuffer(copy_bytes, stack_copy, sizeof(stack_copy), &heap_copy);
     if (copy)
     {
-      memcpy(copy, vertices, sizeof(D3DTLVERTEX_COMPAT) * vertex_count);
+      memcpy(copy, vertices, copy_bytes);
       DrawBounds adjusted_bounds;
       if (!ComputeIndexedDrawBounds(copy, vertex_count, indices, index_count, &adjusted_bounds))
         ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
@@ -2579,7 +2623,7 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
   HRESULT hr = orig(self, primitive_type, vertex_type, draw_vertices, vertex_count, indices, index_count, flags);
   RestoreDepthStateForDraw(self, &snapshot);
   if (copy)
-    HeapFree(GetProcessHeap(), 0, copy);
+    ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -3337,45 +3381,40 @@ static int PatchVTableSlot(void* obj, int slot, void* hook)
                              &g_hook_count, obj, slot, hook);
 }
 
-static int IsGuid(REFIID a, const GUID* b)
-{
-  return a && b && memcmp(a, b, sizeof(GUID)) == 0;
-}
-
 static int IsD3D1DeviceGuid(REFIID riid)
 {
-  return IsGuid(riid, &kIID_IDirect3DDevice) ||
-         IsGuid(riid, &kIID_IDirect3DRampDevice) ||
-         IsGuid(riid, &kIID_IDirect3DRGBDevice) ||
-         IsGuid(riid, &kIID_IDirect3DHALDevice) ||
-         IsGuid(riid, &kIID_IDirect3DMMXDevice);
+  return ZfixIsGuid(riid, &kIID_IDirect3DDevice) ||
+         ZfixIsGuid(riid, &kIID_IDirect3DRampDevice) ||
+         ZfixIsGuid(riid, &kIID_IDirect3DRGBDevice) ||
+         ZfixIsGuid(riid, &kIID_IDirect3DHALDevice) ||
+         ZfixIsGuid(riid, &kIID_IDirect3DMMXDevice);
 }
 
 static const char* KnownGuidName(REFIID riid)
 {
-  if (IsGuid(riid, &kIID_IDirectDraw2))
+  if (ZfixIsGuid(riid, &kIID_IDirectDraw2))
     return "IDirectDraw2";
-  if (IsGuid(riid, &kIID_IDirect3D))
+  if (ZfixIsGuid(riid, &kIID_IDirect3D))
     return "IDirect3D";
-  if (IsGuid(riid, &kIID_IDirect3DRampDevice))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DRampDevice))
     return "IDirect3DRampDevice";
-  if (IsGuid(riid, &kIID_IDirect3DRGBDevice))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DRGBDevice))
     return "IDirect3DRGBDevice";
-  if (IsGuid(riid, &kIID_IDirect3DHALDevice))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DHALDevice))
     return "IDirect3DHALDevice";
-  if (IsGuid(riid, &kIID_IDirect3DMMXDevice))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DMMXDevice))
     return "IDirect3DMMXDevice";
-  if (IsGuid(riid, &kIID_IDirect3D2))
+  if (ZfixIsGuid(riid, &kIID_IDirect3D2))
     return "IDirect3D2";
-  if (IsGuid(riid, &kIID_IDirect3DDevice))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DDevice))
     return "IDirect3DDevice";
-  if (IsGuid(riid, &kIID_IDirect3DDevice2))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DDevice2))
     return "IDirect3DDevice2";
-  if (IsGuid(riid, &kIID_IDirect3DExecuteBuffer))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DExecuteBuffer))
     return "IDirect3DExecuteBuffer";
-  if (IsGuid(riid, &kIID_IDirect3DTexture))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DTexture))
     return "IDirect3DTexture";
-  if (IsGuid(riid, &kIID_IDirect3DTexture2))
+  if (ZfixIsGuid(riid, &kIID_IDirect3DTexture2))
     return "IDirect3DTexture2";
   return "unknown";
 }
@@ -3750,7 +3789,7 @@ static void ClassifyAndPatch(void* obj, REFIID riid)
 
   PatchVTableSlot(obj, 0, (void*)Hook_QueryInterface);
 
-  if (IsGuid(riid, &kIID_IDirect3D))
+  if (ZfixIsGuid(riid, &kIID_IDirect3D))
   {
     LogLine("re1 d3d1 interface observed obj=%p", obj);
   }
@@ -3758,27 +3797,27 @@ static void ClassifyAndPatch(void* obj, REFIID riid)
   {
     PatchD3DDevice(obj);
   }
-  else if (IsGuid(riid, &kIID_IDirect3DExecuteBuffer))
+  else if (ZfixIsGuid(riid, &kIID_IDirect3DExecuteBuffer))
   {
     PatchD3DExecuteBuffer(obj);
   }
-  else if (IsGuid(riid, &kIID_IDirect3DTexture))
+  else if (ZfixIsGuid(riid, &kIID_IDirect3DTexture))
   {
     PatchVTableSlot(obj, 4, (void*)Hook_D3DTexture_GetHandle);
   }
-  else if (IsGuid(riid, &kIID_IDirect3D2))
+  else if (ZfixIsGuid(riid, &kIID_IDirect3D2))
   {
     PatchVTableSlot(obj, 8, (void*)Hook_D3D2_CreateDevice);
   }
-  else if (IsGuid(riid, &kIID_IDirect3DDevice2))
+  else if (ZfixIsGuid(riid, &kIID_IDirect3DDevice2))
   {
     PatchD3DDevice2(obj);
   }
-  else if (IsGuid(riid, &kIID_IDirect3DTexture2))
+  else if (ZfixIsGuid(riid, &kIID_IDirect3DTexture2))
   {
     PatchVTableSlot(obj, 3, (void*)Hook_D3DTexture2_GetHandle);
   }
-  else if (IsGuid(riid, &kIID_IDirectDraw2))
+  else if (ZfixIsGuid(riid, &kIID_IDirectDraw2))
   {
     PatchVTableSlot(obj, 6, (void*)Hook_DD_CreateSurface);
   }
@@ -3805,8 +3844,8 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
                 logged, self, name, guid_text, (unsigned long)hr, *ppvObj);
       }
     }
-    if (IsGuid(riid, &kIID_IDirect3DTexture) ||
-        IsGuid(riid, &kIID_IDirect3DTexture2))
+    if (ZfixIsGuid(riid, &kIID_IDirect3DTexture) ||
+        ZfixIsGuid(riid, &kIID_IDirect3DTexture2))
       TraceTextureQueryInterface(self, *ppvObj);
     ClassifyAndPatch(*ppvObj, riid);
   }
@@ -4170,73 +4209,13 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   return hr;
 }
 
-static void* RvaToPtr(BYTE* module, DWORD rva)
-{
-  if (!rva)
-    return NULL;
-  return module + rva;
-}
-
 static int PatchDirectDrawCreateIAT(void)
 {
-  BYTE* base = (BYTE*)GetModuleHandleA(NULL);
-  if (!base)
-    return 0;
-
-  IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-    return 0;
-
-  IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE)
-    return 0;
-
-  IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-  if (!dir.VirtualAddress)
-    return 0;
-
-  IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToPtr(base, dir.VirtualAddress);
-  for (; desc->Name; desc++)
-  {
-    const char* dll = (const char*)RvaToPtr(base, desc->Name);
-    if (!dll || _stricmp(dll, "DDRAW.dll") != 0)
-      continue;
-
-    IMAGE_THUNK_DATA* orig_thunk = (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->OriginalFirstThunk);
-    IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->FirstThunk);
-    if (!orig_thunk)
-      orig_thunk = thunk;
-
-    for (; orig_thunk && orig_thunk->u1.AddressOfData; orig_thunk++, thunk++)
-    {
-#ifdef IMAGE_ORDINAL_FLAG32
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32)
-#else
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
-#endif
-        continue;
-
-      IMAGE_IMPORT_BY_NAME* by_name = (IMAGE_IMPORT_BY_NAME*)RvaToPtr(base, (DWORD)orig_thunk->u1.AddressOfData);
-      if (!by_name || strcmp((const char*)by_name->Name, "DirectDrawCreate") != 0)
-        continue;
-
-      DWORD old_protect = 0;
-      if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old_protect))
-        return 0;
-
-      g_real_direct_draw_create = (DirectDrawCreateProc)(uintptr_t)thunk->u1.Function;
-      thunk->u1.Function = (ULONG_PTR)(uintptr_t)Hook_DirectDrawCreate;
-
-      DWORD ignored = 0;
-      VirtualProtect(&thunk->u1.Function, sizeof(void*), old_protect, &ignored);
-      return 1;
-    }
-  }
-
-  return 0;
+  return ZfixPatchModuleImport(GetModuleHandleA(NULL), "DDRAW.dll",
+                               "DirectDrawCreate", (void*)Hook_DirectDrawCreate,
+                               (void**)&g_real_direct_draw_create);
 }
 
-// DLL entry point.
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
   (void)reserved;

@@ -12,6 +12,10 @@
 #define ZFIX_SKIP_STATE (-1)
 #endif
 
+#ifndef ZFIX_STACK_VERTEX_CAPACITY
+#define ZFIX_STACK_VERTEX_CAPACITY 512u
+#endif
+
 typedef struct DrawBounds {
   float min_x;
   float max_x;
@@ -63,6 +67,51 @@ static inline float Clamp01(float v)
 static inline int NearF(float a, float b, float eps)
 {
   return AbsF(a - b) <= eps;
+}
+
+static inline int ZfixCheckedSizeMul(SIZE_T a, SIZE_T b, SIZE_T* out)
+{
+  if (!out)
+    return 0;
+  if (a != 0 && b > ((SIZE_T)-1) / a)
+    return 0;
+  *out = a * b;
+  return 1;
+}
+
+static inline void* ZfixAcquireCopyBuffer(SIZE_T bytes, void* stack_buffer,
+                                          SIZE_T stack_size, int* heap_allocated)
+{
+  if (heap_allocated)
+    *heap_allocated = 0;
+  if (!bytes)
+    return NULL;
+  if (stack_buffer && bytes <= stack_size)
+    return stack_buffer;
+
+  void* buffer = HeapAlloc(GetProcessHeap(), 0, bytes);
+  if (buffer && heap_allocated)
+    *heap_allocated = 1;
+  return buffer;
+}
+
+static inline void ZfixReleaseCopyBuffer(void* buffer, int heap_allocated)
+{
+  if (buffer && heap_allocated)
+    HeapFree(GetProcessHeap(), 0, buffer);
+}
+
+typedef ULONG(STDMETHODCALLTYPE* ZfixComReleaseProc)(void* self);
+
+static inline void ZfixReleaseComObject(void* obj)
+{
+  if (!obj)
+    return;
+
+  void** vtable = *(void***)obj;
+  ZfixComReleaseProc release = vtable ? (ZfixComReleaseProc)vtable[2] : NULL;
+  if (release)
+    release(obj);
 }
 
 static inline ZfixTexturePageClass ZfixClassifyMaskTexturePage(

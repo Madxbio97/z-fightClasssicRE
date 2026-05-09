@@ -61,7 +61,6 @@ typedef HRESULT(STDMETHODCALLTYPE* D3D9CreateDeviceProc)(void* self, UINT adapte
 typedef HRESULT(STDMETHODCALLTYPE* D3D9ResetProc)(void* self, void* presentation_parameters);
 typedef HRESULT(STDMETHODCALLTYPE* D3D9BeginSceneProc)(void* self);
 typedef HRESULT(STDMETHODCALLTYPE* D3D9EndSceneProc)(void* self);
-typedef ULONG(STDMETHODCALLTYPE* ComReleaseProc)(void* self);
 typedef HRESULT(STDMETHODCALLTYPE* D3D9GetBackBufferProc)(void* self, UINT swap_chain, UINT back_buffer,
                                                          DWORD type, void** surface);
 typedef HRESULT(STDMETHODCALLTYPE* D3D9CreateDepthStencilSurfaceProc)(void* self, UINT width, UINT height,
@@ -188,6 +187,7 @@ static volatile LONG g_dipup_total = 0;
 static volatile LONG g_dipup_accepted = 0;
 static volatile LONG g_dipup_rejected = 0;
 static volatile LONG g_dpup_transparent_accepted = 0;
+static volatile LONG g_dipup_transparent_accepted = 0;
 static volatile LONG g_dpup_cutout_accepted = 0;
 static volatile LONG g_dipup_cutout_accepted = 0;
 static volatile LONG g_frame_counter = 0;
@@ -334,12 +334,12 @@ static void LogLine(const char* fmt, ...)
 
 static LONG LogCounterIncrement(volatile LONG* counter)
 {
-  return (g_log_enabled && counter) ? InterlockedIncrement(counter) : 0;
+  return ZfixLogCounterIncrement(g_log_enabled, counter);
 }
 
 static LONG LogCounterAdd(volatile LONG* counter, LONG value)
 {
-  return (g_log_enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
+  return ZfixLogCounterAdd(g_log_enabled, counter, value);
 }
 
 static void BuildLogPath(HINSTANCE instance)
@@ -404,15 +404,6 @@ static int CanResolveAdaptiveFlatDepth(const ZfixCallsiteProfile* profile)
   return g_adaptive_depth_conflict_resolver && ZfixProfileDepthEnabled(profile);
 }
 
-static void ReleaseComObject(void* obj)
-{
-  if (!obj)
-    return;
-  ComReleaseProc release = (ComReleaseProc)GetVTableSlot(obj, 2);
-  if (release)
-    release(obj);
-}
-
 static int GetTexture2DDesc(void* texture, D3DSURFACE_DESC_COMPAT* desc)
 {
   if (!texture || !desc)
@@ -450,7 +441,7 @@ static void ReleaseOwnedDepthSurface(void)
   LogLine("owned-depth release surface=%p size=%ux%u fmt=%lu",
           g_owned_depth_surface, g_owned_depth_width, g_owned_depth_height,
           g_owned_depth_format);
-  ReleaseComObject(g_owned_depth_surface);
+  ZfixReleaseComObject(g_owned_depth_surface);
   g_owned_depth_device = NULL;
   g_owned_depth_surface = NULL;
   g_owned_depth_width = 0;
@@ -491,7 +482,7 @@ static int GetBackBufferDesc(void* self, D3DSURFACE_DESC_COMPAT* desc)
     if (failures <= 16)
       LogLine("owned-depth backbuffer desc fail #%ld surface=%p", failures, back_buffer);
   }
-  ReleaseComObject(back_buffer);
+  ZfixReleaseComObject(back_buffer);
   return ok;
 }
 
@@ -527,7 +518,7 @@ static void LogCurrentDepthSurface(void* self, const char* reason)
           has_desc ? desc.Width : 0, has_desc ? desc.Height : 0,
           has_desc ? desc.Format : 0, has_desc ? desc.MultiSampleType : 0,
           has_desc ? desc.MultiSampleQuality : 0);
-  ReleaseComObject(current);
+  ZfixReleaseComObject(current);
 }
 
 static int SetOwnedDepthSurface(void* self, const char* reason)
@@ -638,78 +629,11 @@ static int EnsureOwnedDepthSurface(void* self, const char* reason)
   return 0;
 }
 
-static void* RvaToPtr(BYTE* module, DWORD rva)
-{
-  if (!rva)
-    return NULL;
-  return module + rva;
-}
-
-static int PatchModuleImport(HMODULE module, const char* dll_name, const char* proc_name,
-                             void* hook, void** original)
-{
-  BYTE* base = (BYTE*)module;
-  IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-  if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE)
-    return 0;
-
-  IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE)
-    return 0;
-
-  IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-  if (!dir.VirtualAddress)
-    return 0;
-
-  int patched = 0;
-  IMAGE_IMPORT_DESCRIPTOR* desc = (IMAGE_IMPORT_DESCRIPTOR*)RvaToPtr(base, dir.VirtualAddress);
-  for (; desc && desc->Name; desc++)
-  {
-    const char* imported_dll = (const char*)RvaToPtr(base, desc->Name);
-    if (!imported_dll || _stricmp(imported_dll, dll_name) != 0)
-      continue;
-
-    IMAGE_THUNK_DATA* orig_thunk = (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->OriginalFirstThunk);
-    IMAGE_THUNK_DATA* thunk = (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->FirstThunk);
-    if (!orig_thunk)
-      orig_thunk = thunk;
-
-    for (; orig_thunk && thunk && orig_thunk->u1.AddressOfData; orig_thunk++, thunk++)
-    {
-#ifdef IMAGE_ORDINAL_FLAG32
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32)
-#else
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
-#endif
-        continue;
-
-      IMAGE_IMPORT_BY_NAME* by_name = (IMAGE_IMPORT_BY_NAME*)RvaToPtr(base, (DWORD)orig_thunk->u1.AddressOfData);
-      if (!by_name || strcmp((const char*)by_name->Name, proc_name) != 0)
-        continue;
-
-      void** target = (void**)&thunk->u1.Function;
-      if (*target == hook)
-        continue;
-      if (original && !*original)
-        *original = *target;
-
-      DWORD old_protect = 0;
-      if (!VirtualProtect(target, sizeof(void*), PAGE_READWRITE, &old_protect))
-        continue;
-      *target = hook;
-      DWORD ignored = 0;
-      VirtualProtect(target, sizeof(void*), old_protect, &ignored);
-      FlushInstructionCache(GetCurrentProcess(), target, sizeof(void*));
-      patched++;
-    }
-  }
-  return patched;
-}
-
 static void PatchLoadedModuleImports(HMODULE module)
 {
-  int patched = PatchModuleImport(module, "d3d9.dll", "Direct3DCreate9",
-                                  (void*)Hook_Direct3DCreate9, (void**)&g_real_direct3d_create9);
+  int patched = ZfixPatchModuleImport(module, "d3d9.dll", "Direct3DCreate9",
+                                      (void*)Hook_Direct3DCreate9,
+                                      (void**)&g_real_direct3d_create9);
   if (patched)
     LogLine("patched Direct3DCreate9 imports=%d module=%p", patched, module);
 }
@@ -939,13 +863,19 @@ static int ReadUPIndex(const void* index_data, DWORD index_format, DWORD index_o
 
 static D3D9TLVERTEX* BuildIndexedVertexList(const D3D9TLVERTEX* vertices, UINT num_vertices,
                                             const void* index_data, DWORD index_format,
-                                            DWORD index_count)
+                                            DWORD index_count, D3D9TLVERTEX* stack_buffer,
+                                            SIZE_T stack_count, int* heap_allocated)
 {
   if (!vertices || !index_data || num_vertices == 0 || index_count == 0 || index_count > 8192)
     return NULL;
 
-  D3D9TLVERTEX* indexed = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0,
-                                                   sizeof(D3D9TLVERTEX) * (SIZE_T)index_count);
+  SIZE_T bytes = 0;
+  if (!ZfixCheckedSizeMul(sizeof(*vertices), (SIZE_T)index_count, &bytes))
+    return NULL;
+
+  D3D9TLVERTEX* indexed =
+    (D3D9TLVERTEX*)ZfixAcquireCopyBuffer(bytes, stack_buffer,
+                                         stack_count * sizeof(*stack_buffer), heap_allocated);
   if (!indexed)
     return NULL;
 
@@ -954,7 +884,7 @@ static D3D9TLVERTEX* BuildIndexedVertexList(const D3D9TLVERTEX* vertices, UINT n
     DWORD vertex_index = 0;
     if (!ReadUPIndex(index_data, index_format, i, &vertex_index) || vertex_index >= num_vertices)
     {
-      HeapFree(GetProcessHeap(), 0, indexed);
+      ZfixReleaseCopyBuffer(indexed, heap_allocated ? *heap_allocated : 0);
       return NULL;
     }
     indexed[i] = vertices[vertex_index];
@@ -1598,8 +1528,18 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   D3D9StateSnapshot snapshot;
   CaptureState(self, &snapshot);
 
-  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)vertex_count;
-  D3D9TLVERTEX* copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+  D3D9TLVERTEX stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  SIZE_T bytes = 0;
+  if (!ZfixCheckedSizeMul((SIZE_T)vertex_stride, (SIZE_T)vertex_count, &bytes))
+  {
+    ForceModelState(self, &snapshot);
+    HRESULT hr = orig(self, primitive_type, primitive_count, vertex_data, vertex_stride);
+    RestoreState(self, &snapshot);
+    return hr;
+  }
+
+  int heap_copy = 0;
+  D3D9TLVERTEX* copy = (D3D9TLVERTEX*)ZfixAcquireCopyBuffer(bytes, stack_copy, sizeof(stack_copy), &heap_copy);
   if (!copy)
   {
     ForceModelState(self, &snapshot);
@@ -1635,7 +1575,7 @@ static HRESULT DrawPrimitiveUPWithModelDepth(void* self, D3D9DrawPrimitiveUPProc
   }
   HRESULT hr = orig(self, primitive_type, primitive_count, copy, vertex_stride);
   RestoreState(self, &snapshot);
-  HeapFree(GetProcessHeap(), 0, copy);
+  ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -1652,13 +1592,16 @@ static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrim
   if (!cutout)
     ForceTransparentModelState(self, &snapshot, 0);
 
-  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)vertex_count;
   D3D9TLVERTEX* copy = NULL;
   const void* draw_vertices = vertex_data;
+  D3D9TLVERTEX stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  int heap_copy = 0;
 
   if (cutout)
   {
-    copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+    SIZE_T bytes = 0;
+    if (ZfixCheckedSizeMul((SIZE_T)vertex_stride, (SIZE_T)vertex_count, &bytes))
+      copy = (D3D9TLVERTEX*)ZfixAcquireCopyBuffer(bytes, stack_copy, sizeof(stack_copy), &heap_copy);
     if (copy)
     {
       memcpy(copy, vertex_data, bytes);
@@ -1697,7 +1640,7 @@ static HRESULT DrawPrimitiveUPWithTransparentModelDepth(void* self, D3D9DrawPrim
   HRESULT hr = orig(self, primitive_type, primitive_count, draw_vertices, vertex_stride);
   RestoreState(self, &snapshot);
   if (copy)
-    HeapFree(GetProcessHeap(), 0, copy);
+    ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -1713,8 +1656,19 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
   CaptureState(self, &snapshot);
   const DWORD index_count = VertexCountForPrimitive(primitive_type, primitive_count);
 
-  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)num_vertices;
-  D3D9TLVERTEX* copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+  D3D9TLVERTEX stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  SIZE_T bytes = 0;
+  if (!ZfixCheckedSizeMul((SIZE_T)vertex_stride, (SIZE_T)num_vertices, &bytes))
+  {
+    ForceModelState(self, &snapshot);
+    HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
+                      index_data, index_format, vertex_data, vertex_stride);
+    RestoreState(self, &snapshot);
+    return hr;
+  }
+
+  int heap_copy = 0;
+  D3D9TLVERTEX* copy = (D3D9TLVERTEX*)ZfixAcquireCopyBuffer(bytes, stack_copy, sizeof(stack_copy), &heap_copy);
   if (!copy)
   {
     ForceModelState(self, &snapshot);
@@ -1760,7 +1714,7 @@ static HRESULT DrawIndexedPrimitiveUPWithModelDepth(void* self, D3D9DrawIndexedP
   HRESULT hr = orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                     index_data, index_format, copy, vertex_stride);
   RestoreState(self, &snapshot);
-  HeapFree(GetProcessHeap(), 0, copy);
+  ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -1779,13 +1733,16 @@ static HRESULT DrawIndexedPrimitiveUPWithTransparentModelDepth(void* self, D3D9D
   if (!cutout)
     ForceTransparentModelState(self, &snapshot, 0);
 
-  const SIZE_T bytes = (SIZE_T)vertex_stride * (SIZE_T)num_vertices;
   D3D9TLVERTEX* copy = NULL;
   const void* draw_vertices = vertex_data;
+  D3D9TLVERTEX stack_copy[ZFIX_STACK_VERTEX_CAPACITY];
+  int heap_copy = 0;
 
   if (cutout)
   {
-    copy = (D3D9TLVERTEX*)HeapAlloc(GetProcessHeap(), 0, bytes);
+    SIZE_T bytes = 0;
+    if (ZfixCheckedSizeMul((SIZE_T)vertex_stride, (SIZE_T)num_vertices, &bytes))
+      copy = (D3D9TLVERTEX*)ZfixAcquireCopyBuffer(bytes, stack_copy, sizeof(stack_copy), &heap_copy);
     if (copy)
     {
       memcpy(copy, vertex_data, bytes);
@@ -1833,7 +1790,7 @@ static HRESULT DrawIndexedPrimitiveUPWithTransparentModelDepth(void* self, D3D9D
                     index_data, index_format, draw_vertices, vertex_stride);
   RestoreState(self, &snapshot);
   if (copy)
-    HeapFree(GetProcessHeap(), 0, copy);
+    ZfixReleaseCopyBuffer(copy, heap_copy);
   return hr;
 }
 
@@ -1983,8 +1940,12 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
   }
 
   const D3D9TLVERTEX* vertices = (const D3D9TLVERTEX*)vertex_data;
+  D3D9TLVERTEX indexed_stack[ZFIX_STACK_VERTEX_CAPACITY];
+  int indexed_heap = 0;
   D3D9TLVERTEX* indexed = BuildIndexedVertexList(vertices, num_vertices, index_data,
-                                                 index_format, index_count);
+                                                 index_format, index_count,
+                                                 indexed_stack, ARRAYSIZE(indexed_stack),
+                                                 &indexed_heap);
   if (!indexed)
   {
     LogCounterIncrement(&g_dipup_rejected);
@@ -2017,22 +1978,22 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_DrawIndexedPrimitiveUP(void* self, DW
       if (alpha_class == ALPHA_MODEL_CUTOUT)
         LogCounterIncrement(&g_dipup_cutout_accepted);
       else
-        LogCounterIncrement(&g_dpup_transparent_accepted);
-      HeapFree(GetProcessHeap(), 0, indexed);
+        LogCounterIncrement(&g_dipup_transparent_accepted);
+      ZfixReleaseCopyBuffer(indexed, indexed_heap);
       return DrawIndexedPrimitiveUPWithTransparentModelDepth(self, orig, primitive_type,
-                                                            min_vertex_index, num_vertices,
+                                                             min_vertex_index, num_vertices,
                                                             primitive_count, index_data,
                                                             index_format, vertex_data,
                                                             vertex_stride, alpha_class, caller);
     }
     LogCounterIncrement(&g_dipup_rejected);
-    HeapFree(GetProcessHeap(), 0, indexed);
+    ZfixReleaseCopyBuffer(indexed, indexed_heap);
     return orig(self, primitive_type, min_vertex_index, num_vertices, primitive_count,
                 index_data, index_format, vertex_data, vertex_stride);
   }
 
   LogCounterIncrement(&g_dipup_accepted);
-  HeapFree(GetProcessHeap(), 0, indexed);
+  ZfixReleaseCopyBuffer(indexed, indexed_heap);
   return DrawIndexedPrimitiveUPWithModelDepth(self, orig, primitive_type, min_vertex_index,
                                              num_vertices, primitive_count, index_data,
                                              index_format, vertex_data, vertex_stride, caller);
@@ -2088,15 +2049,16 @@ static HRESULT STDMETHODCALLTYPE Hook_D3D9_EndScene(void* self)
     if (frame <= g_initial_frame_summaries ||
         (g_frame_summary_interval > 0 && (frame % g_frame_summary_interval) == 0))
     {
-      LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld transparent=%ld cutout=%ld/%ld "
-              "dipup=%ld dipupAccepted=%ld dipupRejected=%ld depthPrepass=%ld/%ld depthClear=%ld depthFail=%ld "
+      LogLine("frame=%ld dp=%ld dip=%ld dpup=%ld accepted=%ld transparent=%ld cutout=%ld "
+              "dipup=%ld dipupAccepted=%ld dipupTransparent=%ld dipupCutout=%ld dipupRejected=%ld "
+              "depthPrepass=%ld/%ld depthClear=%ld depthFail=%ld "
               "profiles=%ld adaptive=%ld/%ld "
               "stride=%ld alpha=%ld axis=%ld rhw=%ld other=%ld "
               "setTex=%ld tex0Changes=%ld setFVF=%ld setRS=%ld curTex0=%p wh=%ux%u curFVF=0x%lX "
               "ownedDepthCreate=%ld ownedDepthSet=%ld ownedDepthFail=%ld",
               frame, g_dp_calls, g_dip_calls, g_dpup_total, g_dpup_accepted,
-              g_dpup_transparent_accepted, g_dpup_cutout_accepted, g_dipup_cutout_accepted,
-              g_dipup_total, g_dipup_accepted,
+              g_dpup_transparent_accepted, g_dpup_cutout_accepted,
+              g_dipup_total, g_dipup_accepted, g_dipup_transparent_accepted, g_dipup_cutout_accepted,
               g_dipup_rejected, g_model_depth_prepass_draws, g_model_depth_prepass_failures,
               g_depth_clear_count, g_depth_clear_failures,
               g_callsite_profile_hits, g_adaptive_depth_draws, g_adaptive_depth_vertices,
