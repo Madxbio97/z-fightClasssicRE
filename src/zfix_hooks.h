@@ -2,6 +2,7 @@
 #define ZFIX_HOOKS_H
 
 #include <windows.h>
+#include <string.h>
 
 typedef struct HookEntry {
   void** vtable;
@@ -16,6 +17,11 @@ static inline void* GetVTableSlot(void* obj, int slot)
 
   void** vtable = *(void***)obj;
   return vtable ? vtable[slot] : NULL;
+}
+
+static inline int ZfixIsGuid(REFIID a, const GUID* b)
+{
+  return a && b && memcmp(a, b, sizeof(GUID)) == 0;
 }
 
 static inline void* ZfixGetOriginal(HookEntry* hooks, volatile LONG* hook_count,
@@ -33,6 +39,17 @@ static inline void* ZfixGetOriginal(HookEntry* hooks, volatile LONG* hook_count,
   return NULL;
 }
 
+static inline void ZfixAcquirePatchLock(volatile LONG* lock)
+{
+  while (InterlockedCompareExchange(lock, 1, 0) != 0)
+    Sleep(0);
+}
+
+static inline void ZfixReleasePatchLock(volatile LONG* lock)
+{
+  InterlockedExchange(lock, 0);
+}
+
 static inline int ZfixPatchVTableSlot(HookEntry* hooks, LONG hook_capacity,
                                       volatile LONG* hook_count, void* obj,
                                       int slot, void* hook)
@@ -40,9 +57,16 @@ static inline int ZfixPatchVTableSlot(HookEntry* hooks, LONG hook_capacity,
   if (!hooks || !hook_count || hook_capacity <= 0 || !obj)
     return 0;
 
+  static volatile LONG patch_lock = 0;
+  int result = 0;
+  ZfixAcquirePatchLock(&patch_lock);
+
   void** vtable = *(void***)obj;
   if (!vtable || vtable[slot] == hook)
-    return 1;
+  {
+    result = vtable ? 1 : 0;
+    goto done;
+  }
 
   LONG count = *hook_count;
   if (count < 0)
@@ -52,41 +76,129 @@ static inline int ZfixPatchVTableSlot(HookEntry* hooks, LONG hook_capacity,
   for (LONG i = 0; i < count; i++)
   {
     if (hooks[i].vtable == vtable && hooks[i].slot == slot)
-      return 1;
+    {
+      result = 1;
+      goto done;
+    }
   }
 
   if (*hook_count >= hook_capacity)
-    return 0;
+    goto done;
 
   DWORD old_protect = 0;
   if (!VirtualProtect(&vtable[slot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old_protect))
-    return 0;
+    goto done;
 
   if (vtable[slot] == hook)
   {
     DWORD ignored = 0;
     VirtualProtect(&vtable[slot], sizeof(void*), old_protect, &ignored);
-    return 1;
+    result = 1;
+    goto done;
   }
 
-  const LONG idx = InterlockedIncrement(hook_count) - 1;
+  const LONG idx = *hook_count;
   if (idx < 0 || idx >= hook_capacity)
   {
     DWORD ignored = 0;
     VirtualProtect(&vtable[slot], sizeof(void*), old_protect, &ignored);
-    InterlockedDecrement(hook_count);
-    return 0;
+    goto done;
   }
 
   hooks[idx].vtable = vtable;
   hooks[idx].slot = slot;
   hooks[idx].original = vtable[slot];
+  InterlockedExchange(hook_count, idx + 1);
   vtable[slot] = hook;
 
   DWORD ignored = 0;
   VirtualProtect(&vtable[slot], sizeof(void*), old_protect, &ignored);
   FlushInstructionCache(GetCurrentProcess(), &vtable[slot], sizeof(void*));
-  return 1;
+  result = 1;
+
+done:
+  ZfixReleasePatchLock(&patch_lock);
+  return result;
+}
+
+static inline void* ZfixRvaToPtr(BYTE* module, DWORD rva)
+{
+  return (module && rva) ? (void*)(module + rva) : NULL;
+}
+
+static inline int ZfixPatchModuleImport(HMODULE module, const char* dll_name,
+                                        const char* proc_name, void* hook,
+                                        void** original)
+{
+  if (!module || !dll_name || !proc_name || !hook)
+    return 0;
+
+  BYTE* base = (BYTE*)module;
+  IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    return 0;
+  if (dos->e_lfanew <= 0)
+    return 0;
+
+  IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE)
+    return 0;
+
+  IMAGE_DATA_DIRECTORY dir =
+    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+  if (!dir.VirtualAddress)
+    return 0;
+
+#ifdef IMAGE_ORDINAL_FLAG32
+  const ULONG_PTR ordinal_flag = IMAGE_ORDINAL_FLAG32;
+#else
+  const ULONG_PTR ordinal_flag = IMAGE_ORDINAL_FLAG;
+#endif
+
+  int patched = 0;
+  IMAGE_IMPORT_DESCRIPTOR* desc =
+    (IMAGE_IMPORT_DESCRIPTOR*)ZfixRvaToPtr(base, dir.VirtualAddress);
+  for (; desc && desc->Name; desc++)
+  {
+    const char* imported_dll = (const char*)ZfixRvaToPtr(base, desc->Name);
+    if (!imported_dll || _stricmp(imported_dll, dll_name) != 0)
+      continue;
+
+    IMAGE_THUNK_DATA* orig_thunk =
+      (IMAGE_THUNK_DATA*)ZfixRvaToPtr(base, desc->OriginalFirstThunk);
+    IMAGE_THUNK_DATA* thunk =
+      (IMAGE_THUNK_DATA*)ZfixRvaToPtr(base, desc->FirstThunk);
+    if (!orig_thunk)
+      orig_thunk = thunk;
+
+    for (; orig_thunk && thunk && orig_thunk->u1.AddressOfData; orig_thunk++, thunk++)
+    {
+      if (orig_thunk->u1.Ordinal & ordinal_flag)
+        continue;
+
+      IMAGE_IMPORT_BY_NAME* by_name =
+        (IMAGE_IMPORT_BY_NAME*)ZfixRvaToPtr(base, (DWORD)orig_thunk->u1.AddressOfData);
+      if (!by_name || strcmp((const char*)by_name->Name, proc_name) != 0)
+        continue;
+
+      void** target = (void**)&thunk->u1.Function;
+      if (*target == hook)
+        continue;
+      if (original && !*original)
+        *original = *target;
+
+      DWORD old_protect = 0;
+      if (!VirtualProtect(target, sizeof(void*), PAGE_READWRITE, &old_protect))
+        continue;
+
+      *target = hook;
+      DWORD ignored = 0;
+      VirtualProtect(target, sizeof(void*), old_protect, &ignored);
+      FlushInstructionCache(GetCurrentProcess(), target, sizeof(void*));
+      patched++;
+    }
+  }
+  return patched;
 }
 
 #endif

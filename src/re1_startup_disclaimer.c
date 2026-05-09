@@ -233,11 +233,6 @@ static void LogLine(const char* fmt, ...)
   va_end(args);
 }
 
-static int IsGuid(REFIID a, const GUID* b)
-{
-  return a && b && memcmp(a, b, sizeof(GUID)) == 0;
-}
-
 static void BuildGamePath(const char* relative_path, char* out, size_t out_size)
 {
   if (!out || out_size == 0)
@@ -1227,9 +1222,7 @@ static int DrawDisclaimer(void* surface, int present_event)
     present_event || ((desc.ddsCaps.dwCaps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER)) != 0);
   if (!effective_present)
     return 0;
-  int unused_w = 0;
-  int unused_h = 0;
-  ResolveGameWindow(&unused_w, &unused_h);
+  ResolveGameWindow(NULL, NULL);
 
   const DWORD now = GetTickCount();
   if (!g_start_tick)
@@ -1366,7 +1359,7 @@ static HRESULT STDMETHODCALLTYPE Hook_QueryInterface(void* self, REFIID riid, vo
   if (SUCCEEDED(hr) && ppvObj && *ppvObj && !g_retired)
   {
     PatchVTableSlot(*ppvObj, 0, (void*)Hook_QueryInterface);
-    if (IsGuid(riid, &kIID_IDirectDraw2))
+    if (ZfixIsGuid(riid, &kIID_IDirectDraw2))
       PatchVTableSlot(*ppvObj, 6, (void*)Hook_DD_CreateSurface);
   }
 
@@ -1388,74 +1381,11 @@ static HRESULT WINAPI Hook_DirectDrawCreate(GUID* lpGUID, void** lplpDD, void* p
   return hr;
 }
 
-static void* RvaToPtr(BYTE* base, DWORD rva)
-{
-  return rva ? (void*)(base + rva) : NULL;
-}
-
 static int PatchDirectDrawCreateIAT(void)
 {
-  HMODULE exe = GetModuleHandleA(NULL);
-  if (!exe)
-    return 0;
-
-  BYTE* base = (BYTE*)exe;
-  IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
-  if (dos->e_magic != IMAGE_DOS_SIGNATURE)
-    return 0;
-
-  IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE)
-    return 0;
-
-  IMAGE_DATA_DIRECTORY dir =
-    nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-  if (!dir.VirtualAddress)
-    return 0;
-
-  IMAGE_IMPORT_DESCRIPTOR* desc =
-    (IMAGE_IMPORT_DESCRIPTOR*)RvaToPtr(base, dir.VirtualAddress);
-  for (; desc && desc->Name; desc++)
-  {
-    const char* dll = (const char*)RvaToPtr(base, desc->Name);
-    if (!dll || _stricmp(dll, "DDRAW.dll") != 0)
-      continue;
-
-    IMAGE_THUNK_DATA* orig_thunk =
-      (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->OriginalFirstThunk);
-    IMAGE_THUNK_DATA* thunk =
-      (IMAGE_THUNK_DATA*)RvaToPtr(base, desc->FirstThunk);
-    if (!orig_thunk)
-      orig_thunk = thunk;
-
-    for (; orig_thunk && orig_thunk->u1.AddressOfData; orig_thunk++, thunk++)
-    {
-#ifdef IMAGE_ORDINAL_FLAG32
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG32)
-#else
-      if (orig_thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG)
-#endif
-        continue;
-
-      IMAGE_IMPORT_BY_NAME* by_name =
-        (IMAGE_IMPORT_BY_NAME*)RvaToPtr(base, (DWORD)orig_thunk->u1.AddressOfData);
-      if (!by_name || strcmp((const char*)by_name->Name, "DirectDrawCreate") != 0)
-        continue;
-
-      DWORD old_protect = 0;
-      if (!VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &old_protect))
-        return 0;
-
-      g_real_direct_draw_create = (DirectDrawCreateProc)(uintptr_t)thunk->u1.Function;
-      thunk->u1.Function = (ULONG_PTR)(uintptr_t)Hook_DirectDrawCreate;
-
-      DWORD ignored = 0;
-      VirtualProtect(&thunk->u1.Function, sizeof(void*), old_protect, &ignored);
-      return 1;
-    }
-  }
-
-  return 0;
+  return ZfixPatchModuleImport(GetModuleHandleA(NULL), "DDRAW.dll",
+                               "DirectDrawCreate", (void*)Hook_DirectDrawCreate,
+                               (void**)&g_real_direct_draw_create);
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
