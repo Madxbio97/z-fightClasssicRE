@@ -22,6 +22,8 @@ not part of the active build.
   or near-flat model batches.
 - Keeps the legacy Direct3D 1 execute-buffer hook needed by some RE1 builds for
   model/shadow depth discipline.
+- Keeps D3D1 foreground mask and overlay texture pages out of the z-fight
+  state patch, so background masks keep their original draw-order behavior.
 
 ### Resident Evil 2
 
@@ -33,6 +35,8 @@ not part of the active build.
   disabled.
 - Uses model callsite profiles and adaptive depth conflict resolution for flat
   or near-flat model batches.
+- Guards D3D2 mask-like overlay quads on classic or hires mask texture pages so
+  they bypass the model z-fight path.
 
 ### Resident Evil 3 Classic Rebirth
 

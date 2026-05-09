@@ -40,9 +40,6 @@
 #define D3DRENDERSTATE_FOGENABLE 28
 #define D3DRENDERSTATE_TEXTUREADDRESSU 44
 #define D3DRENDERSTATE_TEXTUREADDRESSV 45
-#define D3DRENDERSTATE_MIPMAPLODBIAS 46
-#define D3DRENDERSTATE_RANGEFOGENABLE 48
-#define D3DRENDERSTATE_ANISOTROPY 49
 #define D3DCMP_EQUAL 3
 #define D3DCMP_LESSEQUAL 4
 #define D3DCMP_GREATER 5
@@ -65,10 +62,6 @@
 #define D3DRENDERSTATE_SUBPIXEL 31
 #define D3DRENDERSTATE_SUBPIXELX 32
 #define D3DSHADE_GOURAUD 2
-#define D3DTFG_POINT 1
-#define D3DTFG_LINEAR 2
-#define D3DTFN_POINT 1
-#define D3DTFN_LINEAR 2
 #define D3DBLEND_ZERO 1
 #define D3DBLEND_ONE 2
 #define D3DCULL_NONE 1
@@ -84,12 +77,6 @@
 #include "zfix_hooks.h"
 #include "zfix_log.h"
 #include "zfix_profiles.h"
-
-typedef enum D3D1MaskTextureClass {
-  D3D1_MASK_TEXTURE_NONE = 0,
-  D3D1_MASK_TEXTURE_CLASSIC,
-  D3D1_MASK_TEXTURE_HIRES
-} D3D1MaskTextureClass;
 
 typedef struct D3DTLVERTEX_COMPAT {
   float sx;
@@ -2960,23 +2947,19 @@ static int IsKnownD3D1OverlayTexture(DWORD texture)
   return 0;
 }
 
-static D3D1MaskTextureClass ClassifyD3D1MaskTexture(DWORD texture)
+static ZfixTexturePageClass ClassifyD3D1MaskTexture(DWORD texture)
 {
   if (!texture || texture == 0xFFFFFFFFu)
-    return D3D1_MASK_TEXTURE_NONE;
+    return ZFIX_TEXTURE_PAGE_NONE;
 
   const TextureHandleTrace* trace = FindTextureHandleTraceByHandle(texture);
   if (!trace || !trace->width || !trace->height)
-    return D3D1_MASK_TEXTURE_NONE;
+    return ZFIX_TEXTURE_PAGE_NONE;
 
-  const DWORD min_side = trace->width < trace->height ? trace->width : trace->height;
-  const DWORD max_side = trace->width > trace->height ? trace->width : trace->height;
-  if (min_side >= g_re1_d3d1_hires_mask_texture_min_side)
-    return D3D1_MASK_TEXTURE_HIRES;
-  if (min_side >= g_re1_d3d1_classic_mask_texture_min_side &&
-      max_side <= g_re1_d3d1_classic_mask_texture_max_side)
-    return D3D1_MASK_TEXTURE_CLASSIC;
-  return D3D1_MASK_TEXTURE_NONE;
+  return ZfixClassifyMaskTexturePage(trace->width, trace->height,
+                                     g_re1_d3d1_hires_mask_texture_min_side,
+                                     g_re1_d3d1_classic_mask_texture_min_side,
+                                     g_re1_d3d1_classic_mask_texture_max_side);
 }
 
 static void RememberD3D1OverlayTexture(DWORD texture, const DrawBounds* bounds)
@@ -3126,18 +3109,18 @@ static DWORD PatchD3D1ExecuteBufferForShadowClip(void* execute_buffer, DWORD* tr
             const char* skip_reason = NULL;
             int skip_overlay = 0;
             const int exact_d3d1_triangles = instr->size == sizeof(D3DTRIANGLE_COMPAT);
-            const D3D1MaskTextureClass mask_texture =
+            const ZfixTexturePageClass mask_texture =
               exact_d3d1_triangles && instr->count == 2 ?
-              ClassifyD3D1MaskTexture(last_texture) : D3D1_MASK_TEXTURE_NONE;
+              ClassifyD3D1MaskTexture(last_texture) : ZFIX_TEXTURE_PAGE_NONE;
             if (IsKnownD3D1OverlayTexture(last_texture))
             {
               skip_overlay = 1;
               skip_reason = "learned";
             }
-            else if (mask_texture != D3D1_MASK_TEXTURE_NONE)
+            else if (mask_texture != ZFIX_TEXTURE_PAGE_NONE)
             {
               skip_overlay = 1;
-              skip_reason = mask_texture == D3D1_MASK_TEXTURE_HIRES ?
+              skip_reason = mask_texture == ZFIX_TEXTURE_PAGE_HIRES ?
                             "hires-texture" : "classic-texture";
             }
             else if (exact_d3d1_triangles &&
