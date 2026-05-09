@@ -53,6 +53,44 @@ static inline void ZfixBuildLogPath(HINSTANCE instance, char* game_dir,
   strncat(log_path, log_name, log_path_size - strlen(log_path) - 1);
 }
 
+static inline int ZfixFileExists(const char* path)
+{
+  if (!path || !path[0])
+    return 0;
+
+  const DWORD attrs = GetFileAttributesA(path);
+  return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static inline int ZfixMarkerFileExistsNearLog(const char* log_path,
+                                              const char* marker_name)
+{
+  if (!log_path || !log_path[0] || !marker_name || !marker_name[0])
+    return 0;
+
+  char marker_path[MAX_PATH];
+  strncpy(marker_path, log_path, sizeof(marker_path) - 1);
+  marker_path[sizeof(marker_path) - 1] = '\0';
+
+  char* slash = NULL;
+  for (char* p = marker_path; *p; ++p)
+  {
+    if (*p == '\\' || *p == '/')
+      slash = p;
+  }
+  if (!slash)
+    return 0;
+
+  slash[1] = '\0';
+  strncat(marker_path, marker_name, sizeof(marker_path) - strlen(marker_path) - 1);
+  return ZfixFileExists(marker_path);
+}
+
+static inline int ZfixLogEnabledByMarker(const char* log_path)
+{
+  return ZfixMarkerFileExistsNearLog(log_path, "enable_log.txt");
+}
+
 static inline void ZfixLogLineV(int enabled, const char* log_path,
                                 const char* fmt, va_list args)
 {

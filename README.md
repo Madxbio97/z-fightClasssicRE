@@ -98,6 +98,13 @@ Outputs:
 - `re3_zfix.asi`
 - `dc1_zfix.asi`
 
+## Diagnostics
+
+Logging is disabled by default to avoid disk I/O and extra diagnostic work in
+the draw hooks. To enable logs for debugging, create an empty `enable_log.txt`
+file next to the installed `.asi`, then launch the game again. Remove
+`enable_log.txt` after debugging to return to the low-overhead path.
+
 ## Usage
 
 Use only the plugin that matches the game you are running:
@@ -125,7 +132,9 @@ game should only load its own matching ASI.
 
 ### Verifying That The Plugin Loaded
 
-After launching the game, check the game folder for the matching log file:
+Logs are only created when `enable_log.txt` is present next to the plugin.
+With logging enabled, after launching the game check the game folder for the
+matching log file:
 
 - `re1_zfix.log`
 - `re2_zfix.log`
@@ -133,8 +142,9 @@ After launching the game, check the game folder for the matching log file:
 - `dc1_zfix.log`
 
 If the log file appears and contains startup lines, the ASI was loaded. If no
-log file is created, the ASI loader did not load the plugin, the plugin is in
-the wrong folder, or the wrong plugin was copied for that game.
+log file is created while `enable_log.txt` exists, the ASI loader did not load
+the plugin, the plugin is in the wrong folder, or the wrong plugin was copied
+for that game.
 
 ### Updating Or Removing
 

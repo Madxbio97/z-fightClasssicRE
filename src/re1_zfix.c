@@ -352,6 +352,7 @@ static DirectDrawCreateProc g_real_direct_draw_create = NULL;
 static HMODULE g_module = NULL;
 static char g_game_dir[MAX_PATH];
 static char g_log_path[MAX_PATH];
+static int g_log_enabled = 0;
 static volatile LONG g_draw_total = 0;
 static volatile LONG g_draw_model_accepted = 0;
 static volatile LONG g_draw_indexed_model_accepted = 0;
@@ -699,10 +700,23 @@ static void BuildLogPath(HINSTANCE instance)
 
 static void LogLine(const char* fmt, ...)
 {
+  if (!g_log_enabled || !g_diagnostics)
+    return;
+
   va_list args;
   va_start(args, fmt);
-  ZfixLogLineV(g_diagnostics, g_log_path, fmt, args);
+  ZfixLogLineV(1, g_log_path, fmt, args);
   va_end(args);
+}
+
+static LONG LogCounterIncrement(volatile LONG* counter)
+{
+  return (g_log_enabled && counter) ? InterlockedIncrement(counter) : 0;
+}
+
+static LONG LogCounterAdd(volatile LONG* counter, LONG value)
+{
+  return (g_log_enabled && counter) ? InterlockedExchangeAdd(counter, value) + value : 0;
 }
 
 static void ResolveModuleForAddress(DWORD address, ModuleAddressInfo* info)
@@ -729,7 +743,7 @@ static void ResolveModuleForAddress(DWORD address, ModuleAddressInfo* info)
 
 static DrawCallsiteStats* FindOrCreateDrawCallsite(DWORD caller)
 {
-  if (!g_callsite_diagnostics || !caller)
+  if (!g_log_enabled || !g_callsite_diagnostics || !caller)
     return NULL;
 
   LONG count = g_draw_callsite_count;
@@ -811,6 +825,8 @@ static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD p
                             DWORD vertex_count, DWORD index_count, const DrawBounds* before,
                             const DrawBounds* after, DWORD adjusted_vertices)
 {
+  if (!g_log_enabled)
+    return;
   if (!before || !after)
     return;
 
@@ -844,6 +860,9 @@ static void LogZFightSample(DWORD caller, const char* kind, int indexed, DWORD p
 
 static void LogDrawCallsiteSummary(const char* reason)
 {
+  if (!g_log_enabled)
+    return;
+
   LONG count = g_draw_callsite_count;
   if (count > (LONG)ARRAYSIZE(g_draw_callsites))
     count = (LONG)ARRAYSIZE(g_draw_callsites);
@@ -1255,6 +1274,8 @@ static int IndicesAreValid(const WORD* indices, DWORD index_count, DWORD vertex_
 static void LogFlatDepthReject(DWORD caller, const char* label, const DrawBounds* bounds,
                                DWORD primitive_type, DWORD vertex_count, DWORD index_count)
 {
+  if (!g_log_enabled)
+    return;
   if (!bounds)
     return;
 
@@ -1907,20 +1928,23 @@ static DWORD ApplyAdaptiveDepthConflictResolver(D3DTLVERTEX_COMPAT* vertices, DW
   if (!changed)
     return 0;
 
-  InterlockedIncrement(&g_adaptive_depth_draws);
-  InterlockedExchangeAdd(&g_adaptive_depth_vertices, (LONG)changed);
-  const LONG logged = InterlockedIncrement(&g_adaptive_depth_logged);
-  if (logged <= 96)
+  LogCounterIncrement(&g_adaptive_depth_draws);
+  LogCounterAdd(&g_adaptive_depth_vertices, (LONG)changed);
+  if (g_log_enabled)
   {
-    ModuleAddressInfo info;
-    ResolveModuleForAddress(caller, &info);
-    LogLine("adaptive-depth #%ld %s profile=%s caller=%s+0x%08lX raw=0x%08lX "
-            "verts=%lu changed=%lu mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f "
-            "area=%.2f extent=%.2f maxShift=%.8f",
-            logged, label ? label : "draw", profile ? profile->name : "default",
-            info.module_name, info.module_offset, caller, vertex_count, changed,
-            mode_name, z_span, effective_span, rhw_span, bounds->area, extent,
-            max_shift);
+    const LONG logged = LogCounterIncrement(&g_adaptive_depth_logged);
+    if (logged <= 96)
+    {
+      ModuleAddressInfo info;
+      ResolveModuleForAddress(caller, &info);
+      LogLine("adaptive-depth #%ld %s profile=%s caller=%s+0x%08lX raw=0x%08lX "
+              "verts=%lu changed=%lu mode=%s zSpan=%.8f target=%.8f rhwSpan=%.8f "
+              "area=%.2f extent=%.2f maxShift=%.8f",
+              logged, label ? label : "draw", profile ? profile->name : "default",
+              info.module_name, info.module_offset, caller, vertex_count, changed,
+              mode_name, z_span, effective_span, rhw_span, bounds->area, extent,
+              max_shift);
+    }
   }
   return changed;
 }
@@ -2305,9 +2329,9 @@ static void RunModelDepthPrepass(void* self, D3DDevice2DrawPrimitiveProc orig,
   ApplyBatchRenderState(self, &restore_state);
 
   if (SUCCEEDED(hr))
-    InterlockedIncrement(&g_model_depth_prepass_draws);
+    LogCounterIncrement(&g_model_depth_prepass_draws);
   else
-    InterlockedIncrement(&g_model_depth_prepass_failures);
+    LogCounterIncrement(&g_model_depth_prepass_failures);
 }
 
 static void RunIndexedModelDepthPrepass(void* self, D3DDevice2DrawIndexedPrimitiveProc orig,
@@ -2328,9 +2352,9 @@ static void RunIndexedModelDepthPrepass(void* self, D3DDevice2DrawIndexedPrimiti
   ApplyBatchRenderState(self, &restore_state);
 
   if (SUCCEEDED(hr))
-    InterlockedIncrement(&g_model_depth_prepass_draws);
+    LogCounterIncrement(&g_model_depth_prepass_draws);
   else
-    InterlockedIncrement(&g_model_depth_prepass_failures);
+    LogCounterIncrement(&g_model_depth_prepass_failures);
 }
 
 static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitiveProc orig, DWORD primitive_type,
@@ -2358,7 +2382,7 @@ static HRESULT DrawPrimitiveWithModelDepth(void* self, D3DDevice2DrawPrimitivePr
   ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                        profile, caller, "opaque-dp");
@@ -2407,7 +2431,7 @@ static HRESULT DrawIndexedPrimitiveWithModelDepth(void* self, D3DDevice2DrawInde
     ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
   profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
   if (profile)
-    InterlockedIncrement(&g_callsite_profile_hits);
+    LogCounterIncrement(&g_callsite_profile_hits);
   const DWORD adaptive_changed =
     ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                        profile, caller, "opaque-dip");
@@ -2465,7 +2489,7 @@ static HRESULT DrawPrimitiveWithTransparentModelDepth(void* self, D3DDevice2Draw
       ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
       if (profile)
-        InterlockedIncrement(&g_callsite_profile_hits);
+        LogCounterIncrement(&g_callsite_profile_hits);
       const DWORD adaptive_changed =
         ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                            profile, caller, "cutout-dp");
@@ -2529,7 +2553,7 @@ static HRESULT DrawIndexedPrimitiveWithTransparentModelDepth(void* self, D3DDevi
         ComputeDrawBounds(copy, vertex_count, &adjusted_bounds);
       profile = FindModelCallsiteProfileForDraw(caller, &adjusted_bounds);
       if (profile)
-        InterlockedIncrement(&g_callsite_profile_hits);
+        LogCounterIncrement(&g_callsite_profile_hits);
       const DWORD adaptive_changed =
         ApplyAdaptiveDepthConflictResolver(copy, vertex_count, &adjusted_bounds,
                                            profile, caller, "cutout-dip");
@@ -3824,18 +3848,21 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_BeginScene(void* self)
 
 static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_EndScene(void* self)
 {
-  const LONG scene = InterlockedIncrement(&g_scene_counter);
-  if (scene <= 8 || (scene % 120) == 0)
+  if (g_log_enabled)
   {
-    LogLine("scene=%ld total=%ld acceptDP=%ld acceptDIP=%ld transparent=%ld cutout=%ld "
-            "rejected=%ld zsamples=%ld prepass=%ld/%ld",
-            scene, g_draw_total, g_draw_model_accepted, g_draw_indexed_model_accepted,
-            g_draw_transparent_accepted, g_draw_cutout_accepted, g_draw_rejected,
-            g_zfight_sample_logged, g_model_depth_prepass_draws,
-            g_model_depth_prepass_failures);
+    const LONG scene = InterlockedIncrement(&g_scene_counter);
+    if (scene <= 8 || (scene % 120) == 0)
+    {
+      LogLine("scene=%ld total=%ld acceptDP=%ld acceptDIP=%ld transparent=%ld cutout=%ld "
+              "rejected=%ld zsamples=%ld prepass=%ld/%ld",
+              scene, g_draw_total, g_draw_model_accepted, g_draw_indexed_model_accepted,
+              g_draw_transparent_accepted, g_draw_cutout_accepted, g_draw_rejected,
+              g_zfight_sample_logged, g_model_depth_prepass_draws,
+              g_model_depth_prepass_failures);
+    }
+    if (scene == 60 || scene == 240 || (scene % 720) == 0)
+      LogDrawCallsiteSummary("scene");
   }
-  if (scene == 60 || scene == 240 || (scene % 720) == 0)
-    LogDrawCallsiteSummary("scene");
 
   D3DDevice2EndSceneProc orig = (D3DDevice2EndSceneProc)GetOriginal(*(void***)self, 11);
   return orig ? orig(self) : D3D_OK;
@@ -3855,7 +3882,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
   if (!orig)
     return D3D_OK;
   const DWORD caller = (DWORD)(uintptr_t)_ReturnAddress();
-  InterlockedIncrement(&g_draw_total);
+  LogCounterIncrement(&g_draw_total);
 
   if (!g_enabled || vertex_type != D3DVT_TLVERTEX || !vertices || vertex_count == 0)
   {
@@ -3885,9 +3912,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
       const AlphaModelClass alpha_class =
         ClassifyAlphaModel((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, min_alpha);
       if (alpha_class == ALPHA_MODEL_CUTOUT)
-        InterlockedIncrement(&g_draw_cutout_accepted);
+        LogCounterIncrement(&g_draw_cutout_accepted);
       else
-        InterlockedIncrement(&g_draw_transparent_accepted);
+        LogCounterIncrement(&g_draw_transparent_accepted);
       TrackDrawCallsite(caller, "accept", 0, 1, primitive_type, vertex_count, 0, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
@@ -3896,14 +3923,14 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawPrimitive(void* self, DWORD
                                                    alpha_class);
     }
     ComputeDrawBounds((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, &bounds);
-    InterlockedIncrement(&g_draw_rejected);
+    LogCounterIncrement(&g_draw_rejected);
     TrackDrawCallsite(caller, "reject", 0, 0, primitive_type, vertex_count, 0, tris,
                       reason, &bounds);
     ClearModelDepthBeforeKnown2D(self, caller, vertex_type, vertices, vertex_count, NULL, 0);
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, flags);
   }
 
-  InterlockedIncrement(&g_draw_model_accepted);
+  LogCounterIncrement(&g_draw_model_accepted);
   TrackDrawCallsite(caller, "accept", 0, 0, primitive_type, vertex_count, 0, tris,
                     "ok", &bounds);
   return DrawPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count, flags,
@@ -3919,7 +3946,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
   if (!orig)
     return D3D_OK;
   const DWORD caller = (DWORD)(uintptr_t)_ReturnAddress();
-  InterlockedIncrement(&g_draw_total);
+  LogCounterIncrement(&g_draw_total);
 
   if (!g_enabled || vertex_type != D3DVT_TLVERTEX || !vertices || !indices || vertex_count == 0 || index_count == 0)
   {
@@ -3954,9 +3981,9 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
         ClassifyIndexedAlphaModel((const D3DTLVERTEX_COMPAT*)vertices, vertex_count,
                                   indices, index_count, min_alpha);
       if (alpha_class == ALPHA_MODEL_CUTOUT)
-        InterlockedIncrement(&g_draw_cutout_accepted);
+        LogCounterIncrement(&g_draw_cutout_accepted);
       else
-        InterlockedIncrement(&g_draw_transparent_accepted);
+        LogCounterIncrement(&g_draw_transparent_accepted);
       TrackDrawCallsite(caller, "accept", 1, 1, primitive_type, vertex_count, index_count, tris,
                         alpha_class == ALPHA_MODEL_CUTOUT ? "cutout" : "transparent",
                         &transparent_bounds);
@@ -3975,7 +4002,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
       ComputeDrawBounds((const D3DTLVERTEX_COMPAT*)vertices, vertex_count, &bounds);
     }
 
-    InterlockedIncrement(&g_draw_rejected);
+    LogCounterIncrement(&g_draw_rejected);
     if (bounds_ok)
     {
       TrackDrawCallsite(caller, "reject", 1, 0, primitive_type, vertex_count, index_count, tris,
@@ -3990,7 +4017,7 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice2_DrawIndexedPrimitive(void* self
     return orig(self, primitive_type, vertex_type, vertices, vertex_count, indices, index_count, flags);
   }
 
-  InterlockedIncrement(&g_draw_indexed_model_accepted);
+  LogCounterIncrement(&g_draw_indexed_model_accepted);
   TrackDrawCallsite(caller, "accept", 1, 0, primitive_type, vertex_count, index_count, tris,
                     "ok", &bounds);
   return DrawIndexedPrimitiveWithModelDepth(self, orig, primitive_type, vertex_type, vertices, vertex_count,
@@ -4095,12 +4122,15 @@ static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_BeginScene(void* self)
 
 static HRESULT STDMETHODCALLTYPE Hook_D3DDevice_EndScene(void* self)
 {
-  const LONG scene = InterlockedIncrement(&g_scene_counter);
-  if (scene <= 8 || (scene % 120) == 0)
+  if (g_log_enabled)
   {
-    LogLine("re1 d3d1 scene=%ld executes=%ld patched=%ld shadowStatePatches=%ld",
-            scene, g_d3d1_execute_seen, g_d3d1_execute_patched,
-            g_d3d1_shadow_state_patches);
+    const LONG scene = InterlockedIncrement(&g_scene_counter);
+    if (scene <= 8 || (scene % 120) == 0)
+    {
+      LogLine("re1 d3d1 scene=%ld executes=%ld patched=%ld shadowStatePatches=%ld",
+              scene, g_d3d1_execute_seen, g_d3d1_execute_patched,
+              g_d3d1_shadow_state_patches);
+    }
   }
   D3DDeviceEndSceneProc orig = (D3DDeviceEndSceneProc)GetOriginal(*(void***)self, 20);
   return orig ? orig(self) : D3D_OK;
@@ -4214,12 +4244,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   {
     g_module = instance;
     BuildLogPath(instance);
-    DeleteFileA(g_log_path);
+    g_log_enabled = ZfixLogEnabledByMarker(g_log_path);
+    if (g_log_enabled)
+      DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
     for (DWORD i = 0; i < ARRAYSIZE(g_render_state_cache); i++)
       g_render_state_cache[i] = 0xFFFFFFFFu;
-    LogLine("re1_zfix loaded diagnostics=%d model_callsiteRequired=%d range=0x%08lX..0x%08lX",
-            g_diagnostics, g_require_model_callsite, g_model_callsite_min, g_model_callsite_max);
+    LogLine("re1_zfix loaded log=%d diagnostics=%d model_callsiteRequired=%d range=0x%08lX..0x%08lX",
+            g_log_enabled, g_diagnostics, g_require_model_callsite,
+            g_model_callsite_min, g_model_callsite_max);
     LogLine("depth zbuffer=%d/%d clearEachScene=%d prepass=%d colorZWrite=%d colorZFunc=%d alphaRef=%lu",
             g_preferred_zbuffer_depth, g_fallback_zbuffer_depth, g_clear_depth_each_scene,
             g_model_depth_prepass, g_model_color_pass_z_write, g_model_color_pass_z_func,

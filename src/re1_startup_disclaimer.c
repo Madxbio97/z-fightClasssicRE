@@ -150,6 +150,7 @@ static volatile LONG g_hook_count = 0;
 static DirectDrawCreateProc g_real_direct_draw_create = NULL;
 static char g_game_dir[MAX_PATH];
 static char g_log_path[MAX_PATH];
+static int g_log_enabled = 0;
 
 static StartupDisclaimerImage g_image;
 static StartupDisclaimerFrameBuffer g_frame;
@@ -207,6 +208,9 @@ static void BuildLogPath(HINSTANCE instance)
 
 static void LogLine(const char* fmt, ...)
 {
+  if (!g_log_enabled)
+    return;
+
   va_list args;
   va_start(args, fmt);
   ZfixLogLineV(1, g_log_path, fmt, args);
@@ -1239,11 +1243,13 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
   {
     (void)reserved;
     BuildLogPath(instance);
-    DeleteFileA(g_log_path);
+    g_log_enabled = ZfixLogEnabledByMarker(g_log_path);
+    if (g_log_enabled)
+      DeleteFileA(g_log_path);
     DisableThreadLibraryCalls(instance);
-    LogLine("re1_startup_disclaimer loaded duration=%ums fade=%u/%ums "
+    LogLine("re1_startup_disclaimer loaded log=%d duration=%ums fade=%u/%ums "
             "skip=action-fire(config)+J/XInputX/JoyButton1",
-            STARTUP_DISCLAIMER_DURATION_MS, STARTUP_DISCLAIMER_FADE_IN_MS,
+            g_log_enabled, STARTUP_DISCLAIMER_DURATION_MS, STARTUP_DISCLAIMER_FADE_IN_MS,
             STARTUP_DISCLAIMER_FADE_OUT_MS);
     LogLine("patch DirectDrawCreateIAT=%d", PatchDirectDrawCreateIAT());
   }
